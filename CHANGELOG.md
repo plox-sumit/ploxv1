@@ -1,6 +1,5 @@
 # Changelog
 
-## v2.0.0 - 2025-05-07
 
 ### Security
 - **Replaced `shell=True`** with safe `subprocess.run(args, shell=False)` to prevent shell injection.
