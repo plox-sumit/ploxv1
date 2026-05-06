@@ -1,0 +1,35 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Virtual environments
+.venv/
+venv/
+.env
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets / local files
+*.pem
+secrets/
+*.env
+
+# Project runtime artifacts
+linux_docs/
+aws_docs/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Debug files
+*.heapsnapshot
+.openclaude/
