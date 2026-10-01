@@ -5,6 +5,7 @@ from .repl import (
     setup_model, repl_loop, list_stored_configs,
     load_stored_configs, delete_stored_config, print_welcome, config_from_stored,
 )
+from . import __version__
 from .models import ModelConfig
 
 
@@ -13,6 +14,7 @@ def main():
         prog="ploxv1",
         description="🦊 PloxV1 — Natural language to Linux & AWS CLI, powered by AI",
     )
+    parser.add_argument("--version", action="version", version=f"ploxv1 {__version__}")
     parser.add_argument("--backend", "-b", choices=["ollama", "openrouter", "claude", "nvidia_nim"], help="AI backend")
     parser.add_argument("--model", "-m", help="Model name")
     parser.add_argument("--api-key", "-k", help="API key")

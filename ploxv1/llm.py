@@ -1,9 +1,8 @@
+import functools
 import json
 import os
-import re
 import time
 import requests
-import anthropic
 from .models import ModelConfig, LLMUsage
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -44,8 +43,6 @@ def _api_key(config: ModelConfig, *, required: bool = True) -> str | None:
 
 
 # ── Retry decorator for transient API failures ──────────────────────
-import functools
-
 # Timeout, rate limit, bad gateway, unavailable, gateway timeout
 RETRY_STATUSES = {408, 429, 502, 503, 504}
 
@@ -63,7 +60,8 @@ def _with_retry(func, *, max_retries=3, base_delay=2.0):
                 if e.status not in RETRY_STATUSES or attempt == max_retries:
                     raise
                 delay = base_delay * (2 ** attempt)
-                print(f"  [Rate limited / server busy. Retrying in {delay:.0f}s... ({attempt+1}/{max_retries})]", flush=True)
+                retry_note = f"Retrying in {delay:.0f}s... ({attempt+1}/{max_retries})"
+                print(f"  [Rate limited / server busy. {retry_note}]", flush=True)
                 time.sleep(delay)
     return wrapper
 
@@ -228,8 +226,18 @@ ask_openrouter = _with_retry(_ask_openrouter_raw, max_retries=3, base_delay=2.0)
 
 # ── Anthropic Claude ────────────────────────────────────────────────
 def _ask_claude_raw(messages: list[dict], model: str, config: ModelConfig) -> tuple[str, object, LLMUsage]:
+    api_key = _api_key(config)
+    # Imported here so the other backends work without the anthropic package installed
+    try:
+        import anthropic
+    except ImportError:
+        raise LLMError(
+            "The Claude backend needs the anthropic package. "
+            "Install it with: pip install anthropic   (with pipx: pipx inject ploxv1 anthropic)"
+        )
+
     started = time.perf_counter()
-    client = anthropic.Anthropic(api_key=_api_key(config), timeout=config.timeout or 600, max_retries=2)
+    client = anthropic.Anthropic(api_key=api_key, timeout=config.timeout or 600, max_retries=2)
 
     system_msg = ""
     user_messages = []

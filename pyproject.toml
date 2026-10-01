@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ploxv1"
-version = "2.0.0"
+dynamic = ["version"]
 description = "Natural-language Linux & AWS CLI companion — Ollama, OpenRouter, Claude, NVIDIA NIM"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,6 +20,7 @@ classifiers = [
     "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: System :: Systems Administration",
@@ -28,13 +29,15 @@ classifiers = [
 
 dependencies = [
     "requests>=2.31",
-    "anthropic>=0.39",
 ]
 
 [project.optional-dependencies]
+# Only the Claude backend needs this
+claude = [
+    "anthropic>=0.39",
+]
 dev = [
     "pytest>=8.3",
-    "pytest-mock>=3.14",
     "ruff>=0.8",
 ]
 
@@ -44,9 +47,16 @@ ploxv1 = "ploxv1.cli:main"
 [tool.setuptools.packages.find]
 include = ["ploxv1*"]
 
+# The version lives in one place: ploxv1/__init__.py
+[tool.setuptools.dynamic]
+version = {attr = "ploxv1.__version__"}
+
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
