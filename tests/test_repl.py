@@ -1,6 +1,10 @@
+import os
+
 import pytest
 
-from ploxv1.repl import MAX_REPAIRS
+from ploxv1.llm import LLMError
+from ploxv1.models import LLMUsage
+from ploxv1.repl import MAX_REPAIRS, print_completion_block
 
 from .conftest import plan
 
@@ -71,3 +75,64 @@ def test_declining_a_second_repair_stops_the_task(session):
     )
     assert len(state.prompts) == 2
     assert state.ran == ["ls missing", "ls missing2"]
+
+
+# ── Errors that used to end the session with a traceback ──
+
+
+def test_rejected_api_key_prints_help_instead_of_crashing(session):
+    state = session([TASK], [LLMError("OpenRouter request failed: 401 Unauthorized", 401)])
+    assert "Authentication failed" in state.out
+
+
+def test_other_api_errors_are_shown(session):
+    state = session([TASK], [LLMError("OpenRouter request failed: 500 Server Error", 500)])
+    assert "500 Server Error" in state.out
+
+
+def test_api_error_during_the_json_retry_is_shown(session):
+    state = session([TASK], [{"error": "JSON parse failed", "raw": "hello"}, LLMError("server went away", 503)])
+    assert "server went away" in state.out
+
+
+def test_api_error_while_chatting_about_a_plan_is_shown(session):
+    state = session([TASK, "c"], [plan("rm -rf build"), LLMError("server went away", 503)])
+    assert "server went away" in state.out
+    assert state.ran == []
+
+
+def test_ctrl_c_at_the_confirm_prompt_drops_the_task_not_the_session(session):
+    state = session([TASK, KeyboardInterrupt, "list the files", "y"], [plan("rm -rf build"), plan("ls")])
+    assert "Interrupted" in state.out
+    assert state.ran == ["ls"]
+
+
+def test_commands_given_as_one_string_run_as_one_command(session):
+    state = session(["list the files", "y"], [{"commands": "ls -la", "summary": "s"}])
+    assert state.ran == ["ls -la"]
+
+
+def test_commands_that_are_not_text_are_dropped(session):
+    state = session(["list the files"], [{"commands": [{"cmd": "ls"}]}, {"commands": [None, 3]}])
+    assert state.ran == []
+    assert "Could not generate commands" in state.out
+
+
+def test_token_line_copes_with_a_missing_count(capsys):
+    print_completion_block(LLMUsage(response_time_seconds=1.0, input_tokens=None, output_tokens=42, total_tokens=42))
+    assert "in: ? | out: 42" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("command, lands_in", [
+    ("cd ~", os.path.expanduser("~")),
+    ("cd '~'", os.path.expanduser("~")),
+    ("cd sub", "sub"),
+    ('cd "sub"', "sub"),
+    ("cd sub && ls", "."),
+    ("cd nowhere", "."),
+])
+def test_cd_is_followed_when_it_can_be(session, tmp_path, monkeypatch, command, lands_in):
+    (tmp_path / "sub").mkdir()
+    monkeypatch.chdir(tmp_path)
+    session(["go there", "y"], [plan(command)])
+    assert os.path.samefile(os.getcwd(), tmp_path / lands_in)

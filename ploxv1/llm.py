@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 import requests
@@ -9,9 +10,41 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 NVIDIA_NIM_DEFAULT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
+API_KEY_ENV = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "nvidia_nim": "NVIDIA_NIM_API_KEY",
+    "claude": "ANTHROPIC_API_KEY",
+}
+
+
+class LLMError(RuntimeError):
+    """A backend call failed. `status` is the HTTP status, or None when there was no response."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+def _request_error(backend: str, e: requests.RequestException) -> LLMError:
+    # A timeout has no response, so give it the HTTP code that means the same thing.
+    status = 408 if isinstance(e, requests.Timeout) else getattr(e.response, "status_code", None)
+    return LLMError(f"{backend} request failed: {e}", status)
+
+
+def _api_key(config: ModelConfig, *, required: bool = True) -> str | None:
+    env_var = API_KEY_ENV[config.backend]
+    key = config.api_key or os.environ.get(env_var)
+    if required and not key:
+        raise LLMError(f"No API key for {config.backend}. Set {env_var} or pass --api-key.")
+    return key
+
 
 # ── Retry decorator for transient API failures ──────────────────────
 import functools
+
+# Timeout, rate limit, bad gateway, unavailable, gateway timeout
+RETRY_STATUSES = {408, 429, 502, 503, 504}
+
 
 def _with_retry(func, *, max_retries=3, base_delay=2.0):
     """Decorator: retry on 429 and certain transient errors with exponential backoff."""
@@ -20,19 +53,14 @@ def _with_retry(func, *, max_retries=3, base_delay=2.0):
         for attempt in range(max_retries + 1):
             try:
                 return func(*args, **kwargs)
-            except RuntimeError as e:
-                err_text = str(e)
-                # 429 rate limit OR timeout OR 503/502 service unavailable
-                if ("429" in err_text or "rate" in err_text.lower() or
-                    "timeout" in err_text.lower() or "timed out" in err_text.lower() or
-                    "503" in err_text or "502" in err_text or "Bad gateway" in err_text or
-                    "connection" in err_text.lower()):
-                    if attempt < max_retries:
-                        delay = base_delay * (2 ** attempt)
-                        print(f"  [Rate limited / server busy. Retrying in {delay:.0f}s... ({attempt+1}/{max_retries})]", flush=True)
-                        time.sleep(delay)
-                        continue
-                raise
+            except LLMError as e:
+                # Go by the status code. The error text holds the URL, and
+                # "api/generate" and "integrate.api" both contain "rate".
+                if e.status not in RETRY_STATUSES or attempt == max_retries:
+                    raise
+                delay = base_delay * (2 ** attempt)
+                print(f"  [Rate limited / server busy. Retrying in {delay:.0f}s... ({attempt+1}/{max_retries})]", flush=True)
+                time.sleep(delay)
     return wrapper
 
 
@@ -54,9 +82,11 @@ def _extract_json_from_text(raw: str) -> dict:
     """Try hard to extract valid JSON from a model response that might have extra text."""
     cleaned = strip_code_fences(raw)
 
-    # Try direct parse first
+    # Try direct parse first. A bare list or string is valid JSON but not a plan.
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
         pass
 
@@ -102,6 +132,13 @@ def _build_openai_messages(system_prompt: str, user_content: str, history: list[
     return messages
 
 
+def _first_message(backend: str, data: dict) -> dict:
+    # Some providers answer 200 with an error body instead of choices.
+    if not data.get("choices"):
+        raise LLMError(f"{backend} returned no answer: {str(data.get('error', data))[:300]}")
+    return data["choices"][0]["message"]
+
+
 # ── Ollama ──────────────────────────────────────────────────────────
 def _ask_ollama_raw(prompt: str, model: str, config: ModelConfig) -> tuple[str, object, LLMUsage]:
     started = time.perf_counter()
@@ -130,8 +167,10 @@ def _ask_ollama_raw(prompt: str, model: str, config: ModelConfig) -> tuple[str, 
             ),
         )
         return data.get("response", "").strip(), None, usage
+    except requests.ConnectionError:
+        raise LLMError("Can't reach Ollama at http://localhost:11434. Is it running? Start it with: ollama serve")
     except requests.RequestException as e:
-        raise RuntimeError(f"Ollama request failed: {e}")
+        raise _request_error("Ollama", e)
 
 ask_ollama = _with_retry(_ask_ollama_raw, max_retries=3, base_delay=1.0)
 
@@ -162,11 +201,11 @@ def _ask_openrouter_raw(messages: list[dict], model: str, api_key: str, config: 
         data = response.json()
 
         ended = time.perf_counter()
-        choice = data["choices"][0]
-        content = choice["message"].get("content", "").strip()
+        message = _first_message("OpenRouter", data)
+        content = (message.get("content") or "").strip()
         usage_data = data.get("usage", {})
 
-        reasoning_details = choice["message"].get("reasoning_details")
+        reasoning_details = message.get("reasoning_details")
         usage = LLMUsage(
             response_time_seconds=ended - started,
             input_tokens=usage_data.get("prompt_tokens"),
@@ -175,7 +214,7 @@ def _ask_openrouter_raw(messages: list[dict], model: str, api_key: str, config: 
         )
         return content, reasoning_details, usage
     except requests.RequestException as e:
-        raise RuntimeError(f"OpenRouter request failed: {e}")
+        raise _request_error("OpenRouter", e)
 
 ask_openrouter = _with_retry(_ask_openrouter_raw, max_retries=3, base_delay=2.0)
 
@@ -183,7 +222,7 @@ ask_openrouter = _with_retry(_ask_openrouter_raw, max_retries=3, base_delay=2.0)
 # ── Anthropic Claude ────────────────────────────────────────────────
 def _ask_claude_raw(messages: list[dict], model: str, config: ModelConfig) -> tuple[str, object, LLMUsage]:
     started = time.perf_counter()
-    client = anthropic.Anthropic(timeout=config.timeout or 600, max_retries=2)
+    client = anthropic.Anthropic(api_key=_api_key(config), timeout=config.timeout or 600, max_retries=2)
 
     system_msg = ""
     user_messages = []
@@ -229,13 +268,13 @@ def _ask_claude_raw(messages: list[dict], model: str, config: ModelConfig) -> tu
         )
         return content.strip(), reasoning_details, usage
     except anthropic.AnthropicError as e:
-        raise RuntimeError(f"Anthropic request failed: {e}")
+        raise LLMError(f"Anthropic request failed: {e}", getattr(e, "status_code", None))
 
 ask_claude = _with_retry(_ask_claude_raw, max_retries=3, base_delay=2.0)
 
 
 # ── NVIDIA NIM ──────────────────────────────────────────────────────
-def _ask_nvidia_nim_raw(messages: list[dict], model: str, api_key: str, config: ModelConfig) -> tuple[str, object, LLMUsage]:
+def _ask_nvidia_nim_raw(messages: list[dict], model: str, api_key: str | None, config: ModelConfig) -> tuple[str, object, LLMUsage]:
     """
     Call NVIDIA NIM API (OpenAI-compatible endpoint).
     Default endpoint: https://integrate.api.nvidia.com/v1/chat/completions
@@ -259,10 +298,9 @@ def _ask_nvidia_nim_raw(messages: list[dict], model: str, api_key: str, config: 
     if config.min_tokens:
         payload["min_tokens"] = config.min_tokens
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=config.timeout or None)
@@ -270,11 +308,11 @@ def _ask_nvidia_nim_raw(messages: list[dict], model: str, api_key: str, config: 
         data = response.json()
 
         ended = time.perf_counter()
-        choice = data["choices"][0]
-        content = choice["message"].get("content", "").strip()
+        message = _first_message("NVIDIA NIM", data)
+        content = (message.get("content") or "").strip()
         usage_data = data.get("usage", {})
 
-        reasoning_details = choice["message"].get("reasoning_details")
+        reasoning_details = message.get("reasoning_details")
         input_toks = usage_data.get("prompt_tokens")
         output_toks = usage_data.get("completion_tokens")
         usage = LLMUsage(
@@ -285,7 +323,7 @@ def _ask_nvidia_nim_raw(messages: list[dict], model: str, api_key: str, config: 
         )
         return content, reasoning_details, usage
     except requests.RequestException as e:
-        raise RuntimeError(f"NVIDIA NIM request failed: {e}")
+        raise _request_error("NVIDIA NIM", e)
 
 ask_nvidia_nim = _with_retry(_ask_nvidia_nim_raw, max_retries=5, base_delay=3.0)
 
@@ -314,11 +352,11 @@ def ask_model(prompt: str, config: ModelConfig, history: list[ChatMessage], *, e
     messages = _build_openai_messages(SYSTEM_PROMPT, prompt, history)
 
     if config.backend == "openrouter":
-        assert config.api_key is not None, "api_key required for OpenRouter"
-        raw, reasoning, usage = ask_openrouter(messages, config.model_name, config.api_key, config)
+        raw, reasoning, usage = ask_openrouter(messages, config.model_name, _api_key(config), config)
     elif config.backend == "nvidia_nim":
-        assert config.api_key is not None, "api_key required for NVIDIA NIM"
-        raw, reasoning, usage = ask_nvidia_nim(messages, config.model_name, config.api_key, config)
+        # A NIM container you run yourself needs no key; NVIDIA's cloud does.
+        api_key = _api_key(config, required=not config.nvidia_nim_url)
+        raw, reasoning, usage = ask_nvidia_nim(messages, config.model_name, api_key, config)
     elif config.backend == "claude":
         raw, reasoning, usage = ask_claude(messages, config.model_name, config)
     else:

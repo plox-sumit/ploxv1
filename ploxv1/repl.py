@@ -1,13 +1,14 @@
 import json
 import os
 import random
+import re
 import shutil
 import sys
 import threading
 import time
 
 from .models import ShellContext, ChatMessage, ModelConfig, CommandPlan, CommandExecutionResult, LLMUsage
-from .llm import ask_model_text, ask_model_json
+from .llm import ask_model_text, ask_model_json, LLMError, API_KEY_ENV
 from .prompting import build_command_prompt, build_chat_prompt
 from .repair_prompting import build_repair_prompt
 from .executor import run_single_command
@@ -116,7 +117,6 @@ def box(text: str, border_color: str = PURP, width: int = 70) -> str:
 
 def _visible_len(s: str) -> int:
     """Approximate visible length of a string with ANSI codes."""
-    import re
     return len(re.sub(r"\033\[[0-9;]*m", "", s))
 
 
@@ -331,7 +331,7 @@ def setup_model() -> ModelConfig:
     # ── API key ──
     api_key = None
     nvidia_nim_url = None
-    if backend in ("openrouter", "nvidia_nim"):
+    if backend in API_KEY_ENV:
         if backend == "nvidia_nim":
             print()
             print(f"{PURP}┌{'─' * 56}┐{RST}")
@@ -358,12 +358,11 @@ def setup_model() -> ModelConfig:
                     elif not nvidia_nim_url.endswith("/v1/chat/completions"):
                         nvidia_nim_url = nvidia_nim_url.rstrip("/") + "/v1/chat/completions"
 
-        api_key = input(f"  {PURP_L}API Key (or ENTER to use env var):{RST} ").strip()
-        if not api_key:
-            env_var = "OPENROUTER_API_KEY" if backend == "openrouter" else "NVIDIA_NIM_API_KEY"
-            api_key = os.environ.get(env_var, "")
-            if not api_key:
-                print(f"  {YELLOW}⚠ No API key found. Set {env_var} env var or enter it now.{RST}")
+        # A key left blank is read from the environment at request time, so it is never written to the config file
+        env_var = API_KEY_ENV[backend]
+        api_key = input(f"  {PURP_L}API Key (or ENTER to use {env_var}):{RST} ").strip()
+        if not api_key and not os.environ.get(env_var) and not nvidia_nim_url:
+            print(f"  {YELLOW}⚠ No API key found. Set {env_var} before your first request.{RST}")
 
     # ── Model name ──
     print()
@@ -458,7 +457,10 @@ def print_completion_block(usage: LLMUsage):
     print(f"{PURP}├{'─' * 50}┤{RST}")
     print(f"{PURP}│{RST}  {PURP_L}⏱ Time:{RST}  {WHITE}{mins}m {secs}s{RST}" + " " * (34 - len(f"{mins}m {secs}s")) + f"{PURP}│{RST}")
     if usage.total_tokens:
-        print(f"{PURP}│{RST}  {PURP_L}🔢 Tokens:{RST} {WHITE}{usage.total_tokens:,}{RST} (in: {usage.input_tokens:,} | out: {usage.output_tokens:,})" + " " * 5 + f"{PURP}│{RST}")
+        # A backend can report one count without the other (Ollama leaves out the input count for a cached prompt)
+        tokens_in = "?" if usage.input_tokens is None else f"{usage.input_tokens:,}"
+        tokens_out = "?" if usage.output_tokens is None else f"{usage.output_tokens:,}"
+        print(f"{PURP}│{RST}  {PURP_L}🔢 Tokens:{RST} {WHITE}{usage.total_tokens:,}{RST} (in: {tokens_in} | out: {tokens_out})" + " " * 5 + f"{PURP}│{RST}")
     print(f"{PURP}└{'─' * 50}┘{RST}")
     print()
 
@@ -510,16 +512,15 @@ def chat_reply(user_inp: str, config: ModelConfig, history: list[ChatMessage]) -
     prompt = build_chat_prompt(user_inp, ShellContext(cwd=os.getcwd(), env=dict(os.environ), os_name="windows" if os.name == "nt" else "linux"), history)
     try:
         reply, _, usage = ask_model_text(prompt, config, history)
-    except RuntimeError as e:
-        _handle_api_error(str(e))
+    except LLMError as e:
+        _handle_api_error(e, config)
         return None
     return reply, usage
 
 
-def _handle_api_error(err_text: str) -> bool:
-    """Print user-friendly message for common API errors. Returns True if handled."""
-    err_lower = err_text.lower()
-    if "401" in err_text or "unauthorized" in err_lower:
+def _handle_api_error(error: LLMError, config: ModelConfig):
+    """Print a user-friendly message for an API error."""
+    if error.status == 401:
         print(f"\n  {BRIGHT_RED}✗ Authentication failed.{RST}")
         print(f"  {YELLOW}Your API key was rejected. Please check:{RST}")
         print(f"    1. Did you select the correct backend? (You chose: {config.backend})")
@@ -531,25 +532,35 @@ def _handle_api_error(err_text: str) -> bool:
         elif config.backend == "claude":
             print(f"    2. Claude needs an Anthropic API key (sk-ant-...). Set ANTHROPIC_API_KEY env var.")
         print(f"\n  {CYAN}Run again and enter a valid API key when prompted.{RST}")
-        return True
-    elif "403" in err_text or "forbidden" in err_lower:
+    elif error.status == 403:
         print(f"\n  {BRIGHT_RED}✗ Access forbidden.{RST} Check that your API key has the correct permissions.")
-        return True
-    elif "429" in err_text or "rate" in err_lower:
+    elif error.status == 429:
         print(f"\n  {BRIGHT_YELLOW}⚠ Rate limited. Too many requests. Wait a minute and try again.{RST}")
-        return True
-    return False
+    else:
+        print(f"\n  {BRIGHT_RED}✗ {error}{RST}")
 
 
 MAX_REPAIRS = 3
 
 
-def _ask_json(prompt: str, config: ModelConfig, history: list[ChatMessage]) -> tuple:
+def _with_spinner(ask, prompt: str, config: ModelConfig, history: list[ChatMessage]) -> tuple:
     spinner_start()
     try:
-        return ask_model_json(prompt, config, history)
+        return ask(prompt, config, history)
     finally:
         spinner_stop()
+
+
+def _commands(plan_dict: dict) -> list[str]:
+    """The plan's commands as a clean list. Small models don't always send a list of strings."""
+    if "error" in plan_dict:
+        return []
+    commands = plan_dict.get("commands", [])
+    if isinstance(commands, str):
+        commands = [commands]
+    if not isinstance(commands, list):
+        return []
+    return [c.strip() for c in commands if isinstance(c, str) and c.strip()]
 
 
 def _ask_for_plan(
@@ -557,10 +568,16 @@ def _ask_for_plan(
 ) -> tuple[CommandPlan | None, LLMUsage | None]:
     """Ask the model for a plan. When it can't give one, say why and return no plan."""
     try:
-        plan_dict, _, usage = _ask_json(prompt, config, history)
-    except RuntimeError as e:
-        _handle_api_error(str(e))
+        return _plan_from_model(prompt, config, history, is_repair=is_repair)
+    except LLMError as e:
+        _handle_api_error(e, config)
         return None, None
+
+
+def _plan_from_model(
+    prompt: str, config: ModelConfig, history: list[ChatMessage], *, is_repair: bool
+) -> tuple[CommandPlan | None, LLMUsage | None]:
+    plan_dict, _, usage = _with_spinner(ask_model_json, prompt, config, history)
 
     if "error" in plan_dict and not is_repair:
         retry_prompt = (
@@ -568,7 +585,7 @@ def _ask_for_plan(
             + f"\n\n!!! YOUR LAST RESPONSE WAS NOT VALID JSON. You said:\n{plan_dict.get('raw', '')[:300]}\n\n"
             + "NOW OUTPUT ONLY VALID JSON. No markdown. No backticks. No explanation. ONLY the JSON object."
         )
-        plan_dict, _, usage = _ask_json(retry_prompt, config, history)
+        plan_dict, _, usage = _with_spinner(ask_model_json, retry_prompt, config, history)
 
     if "error" in plan_dict:
         raw_text = plan_dict.get("raw", "")
@@ -579,7 +596,7 @@ def _ask_for_plan(
             print_completion_block(usage)
         return None, usage
 
-    commands = plan_dict.get("commands", [])
+    commands = _commands(plan_dict)
 
     if not commands and not is_repair:
         retry_prompt = (
@@ -587,8 +604,8 @@ def _ask_for_plan(
             + "\n\n!!! You returned valid JSON but 'commands' was EMPTY. "
             + "Populate it with real shell commands the user needs."
         )
-        plan_dict, _, usage = _ask_json(retry_prompt, config, history)
-        commands = plan_dict.get("commands", []) if "error" not in plan_dict else []
+        plan_dict, _, usage = _with_spinner(ask_model_json, retry_prompt, config, history)
+        commands = _commands(plan_dict)
 
     if not commands:
         summary = plan_dict.get("summary", "No plan generated.") if "error" not in plan_dict else "No plan generated."
@@ -700,15 +717,112 @@ def _run_plan(plan: CommandPlan, context: ShellContext) -> CommandExecutionResul
         else:
             print(f"  {GREEN}  ✓ OK{RST}")
 
-        # Update context.cwd if it was a cd command
-        if cmd.strip().startswith("cd "):
-            new_dir = cmd.strip()[3:].strip()
-            if os.path.isabs(new_dir):
-                context.cwd = new_dir
-            else:
-                context.cwd = os.path.normpath(os.path.join(context.cwd, new_dir))
-            os.chdir(context.cwd)
+        # A lone `cd` only moved the child shell, so move ploxv1 itself there too.
+        # `cd x && ls` is left alone: there the move is meant to last for that one line.
+        lone_cd = re.fullmatch(r"cd\s+([^;&|<>]+)", cmd.strip())
+        if lone_cd:
+            target = os.path.expandvars(os.path.expanduser(lone_cd.group(1).strip().strip("'\"")))
+            try:
+                os.chdir(os.path.join(context.cwd, target))
+                context.cwd = os.getcwd()
+            except OSError as e:
+                print(f"  {YELLOW}  ⚠ Could not follow cd: {e}{RST}")
     return None
+
+
+def _handle_request(user_inp: str, config: ModelConfig, context: ShellContext, history: list[ChatMessage]):
+    """Answer one request: a chat reply, or a plan that is confirmed, run and repaired."""
+    history.append(ChatMessage(role="user", content=user_inp))
+
+    # ── Detect chat vs command ──
+    if is_conversational(user_inp):
+        # ── CHAT PATH ──
+        spinner_start()
+        try:
+            result = chat_reply(user_inp, config, history)
+        finally:
+            spinner_stop()
+
+        if result is None:
+            # API error already printed by chat_reply, just skip
+            return
+
+        reply, usage = result
+        history.append(ChatMessage(role="assistant", content=reply))
+
+        # No purple box for chat replies - just plain text
+        print()
+        print(f"  {BOLD}{PURP_L}🦊 ploxv1 says:{RST}")
+        print(f"  {reply}")
+        print_completion_block(usage)
+        return
+
+    # ── COMMAND PATH ──
+    prompt = build_command_prompt(user_inp, context, history)
+    repairs = 0
+    # Auto-confirm lasts for one task
+    auto_confirm = False
+
+    while True:
+        plan, usage = _ask_for_plan(prompt, config, history, is_repair=repairs > 0)
+        if plan is None:
+            break
+
+        decision, auto_confirm = _confirm_plan(plan, auto_confirm)
+
+        if decision == "cancel":
+            print(f"  {YELLOW}✗ Cancelled.{RST}")
+            history.append(ChatMessage(role="assistant", content=f"[Plan was shown but user cancelled]: {plan.summary}"))
+            print_completion_block(usage)
+            break
+
+        if decision == "chat":
+            # Switch to chat mode - NO PURPLE BOX for chat
+            chat_prompt = f"The user saw this plan and wants to chat instead:\n\nPlan: {plan.summary}\nCommands: {', '.join(plan.commands)}\n\nUser said: {user_inp}\n\nHave a conversation about this. Explain what the commands do, suggest alternatives, answer questions."
+            try:
+                reply, _, chat_usage = _with_spinner(ask_model_text, chat_prompt, config, history)
+            except LLMError as e:
+                _handle_api_error(e, config)
+                break
+            print()
+            print(f"  {BOLD}{PURP_L}🦊 ploxv1 says:{RST}")
+            print(f"  {reply}")
+            history.append(ChatMessage(role="assistant", content=reply))
+            print_completion_block(chat_usage)
+            break
+
+        failed = _run_plan(plan, context)
+
+        if failed is None:
+            history.append(ChatMessage(
+                role="assistant",
+                content=f"[Executed plan: {plan.action}]\nCommands:\n" + "\n".join(f"  $ {c}" for c in plan.commands)
+            ))
+            print_completion_block(usage)
+            break
+
+        # Offer repair
+        if repairs >= MAX_REPAIRS:
+            print(f"  {YELLOW}✗ Still failing after {MAX_REPAIRS} repair attempts. Stopping.{RST}")
+            repair_choice = "n"
+        elif not auto_confirm:
+            print()
+            repair_choice = input(f"  {YELLOW}Try to auto-repair? {BRIGHT_GREEN}[Y]{RST}/{BRIGHT_RED}[N]{RST}:{RST} ").strip().lower()
+        else:
+            print(f"  {GREEN}  [Auto-repairing...]{RST}")
+            repair_choice = "y"
+
+        if repair_choice not in ("y", "yes", ""):
+            print(f"  {YELLOW}✗ Abandoned.{RST}")
+            history.append(ChatMessage(role="assistant", content=f"[Plan failed and was abandoned]: {plan.summary}"))
+            break
+
+        repairs += 1
+        prompt = build_repair_prompt(user_inp, plan, failed, context)
+    # End of while True (command loop)
+
+    if auto_confirm:
+        print(f"  {GREY}[Auto-confirm disabled — new task will ask again]{RST}")
 
 
 def repl_loop(config: ModelConfig):
@@ -718,8 +832,6 @@ def repl_loop(config: ModelConfig):
         os_name="windows" if os.name == "nt" else "linux",
     )
     history: list[ChatMessage] = []
-    # Auto-confirm flag: cleared when a new command task starts, active during one task
-    auto_confirm = False
 
     print_highlight_key_val("Backend", config.backend, PURP_L, WHITE)
     print_highlight_key_val("Model", config.model_name, PURP_L, WHITE)
@@ -800,95 +912,8 @@ def repl_loop(config: ModelConfig):
                 print(f"  {YELLOW}Unknown command. Type /help for available commands.{RST}")
                 continue
 
-        # ── History ──
-        history.append(ChatMessage(role="user", content=user_inp))
-
-        # ── Detect chat vs command ──
-        if is_conversational(user_inp):
-            # ── CHAT PATH ──
-            spinner_start()
-            try:
-                result = chat_reply(user_inp, config, history)
-            finally:
-                spinner_stop()
-
-            if result is None:
-                # API error already printed by chat_reply, just skip
-                continue
-
-            reply, usage = result
-            history.append(ChatMessage(role="assistant", content=reply))
-
-            # No purple box for chat replies - just plain text
-            print()
-            print(f"  {BOLD}{PURP_L}🦊 ploxv1 says:{RST}")
-            print(f"  {reply}")
-            print_completion_block(usage)
-            continue
-
-        # ── COMMAND PATH ──
-        prompt = build_command_prompt(user_inp, context, history)
-        repairs = 0
-
-        while True:
-            plan, usage = _ask_for_plan(prompt, config, history, is_repair=repairs > 0)
-            if plan is None:
-                break
-
-            decision, auto_confirm = _confirm_plan(plan, auto_confirm)
-
-            if decision == "cancel":
-                print(f"  {YELLOW}✗ Cancelled.{RST}")
-                history.append(ChatMessage(role="assistant", content=f"[Plan was shown but user cancelled]: {plan.summary}"))
-                print_completion_block(usage)
-                break
-
-            if decision == "chat":
-                # Switch to chat mode - NO PURPLE BOX for chat
-                chat_prompt = f"The user saw this plan and wants to chat instead:\n\nPlan: {plan.summary}\nCommands: {', '.join(plan.commands)}\n\nUser said: {user_inp}\n\nHave a conversation about this. Explain what the commands do, suggest alternatives, answer questions."
-                spinner_start()
-                try:
-                    reply, _, chat_usage = ask_model_text(chat_prompt, config, history)
-                finally:
-                    spinner_stop()
-                print()
-                print(f"  {BOLD}{PURP_L}🦊 ploxv1 says:{RST}")
-                print(f"  {reply}")
-                history.append(ChatMessage(role="assistant", content=reply))
-                print_completion_block(chat_usage)
-                break
-
-            failed = _run_plan(plan, context)
-
-            if failed is None:
-                history.append(ChatMessage(
-                    role="assistant",
-                    content=f"[Executed plan: {plan.action}]\nCommands:\n" + "\n".join(f"  $ {c}" for c in plan.commands)
-                ))
-                print_completion_block(usage)
-                break
-
-            # Offer repair
-            if repairs >= MAX_REPAIRS:
-                print(f"  {YELLOW}✗ Still failing after {MAX_REPAIRS} repair attempts. Stopping.{RST}")
-                repair_choice = "n"
-            elif not auto_confirm:
-                print()
-                repair_choice = input(f"  {YELLOW}Try to auto-repair? {BRIGHT_GREEN}[Y]{RST}/{BRIGHT_RED}[N]{RST}:{RST} ").strip().lower()
-            else:
-                print(f"  {GREEN}  [Auto-repairing...]{RST}")
-                repair_choice = "y"
-
-            if repair_choice not in ("y", "yes", ""):
-                print(f"  {YELLOW}✗ Abandoned.{RST}")
-                history.append(ChatMessage(role="assistant", content=f"[Plan failed and was abandoned]: {plan.summary}"))
-                break
-
-            repairs += 1
-            prompt = build_repair_prompt(user_inp, plan, failed, context)
-        # End of while True (command loop)
-
-        # Reset auto-confirm when a task completes or breaks out
-        if auto_confirm:
-            print(f"  {GREY}[Auto-confirm disabled — new task will ask again]{RST}")
-        auto_confirm = False
+        try:
+            _handle_request(user_inp, config, context, history)
+        except (KeyboardInterrupt, EOFError):
+            # Ctrl+C or Ctrl+D in the middle of a task drops the task, not the session
+            print(f"\n  {YELLOW}✗ Interrupted.{RST}")
