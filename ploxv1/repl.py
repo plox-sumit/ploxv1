@@ -9,7 +9,7 @@ import time
 
 from .models import ShellContext, ChatMessage, ModelConfig, CommandPlan, CommandExecutionResult, LLMUsage
 from .llm import ask_model_text, ask_model_json, LLMError, API_KEY_ENV
-from .prompting import build_command_prompt, build_chat_prompt
+from .prompting import build_prompt
 from .repair_prompting import build_repair_prompt
 from .executor import run_single_command
 from .safety import is_destructive, is_read_only
@@ -265,6 +265,17 @@ def delete_stored_config(name: str) -> bool:
     return False
 
 
+def config_from_stored(cfg: dict) -> ModelConfig:
+    return ModelConfig(
+        backend=cfg["backend"],
+        model_name=cfg["model_name"],
+        api_key=cfg.get("api_key"),
+        nvidia_nim_url=cfg.get("nvidia_nim_url"),
+        max_tokens=cfg.get("max_tokens"),
+        timeout=cfg.get("timeout", 900),
+    )
+
+
 # ── Model setup UI ──────────────────────────────────────────────────
 def setup_model() -> ModelConfig:
     """Interactive model setup with stored config support and token limits."""
@@ -288,20 +299,11 @@ def setup_model() -> ModelConfig:
             choice = "new"
 
         if choice.lower() != "new" and choice in stored:
-            cfg_data = stored[choice]
-            config = ModelConfig(
-                backend=cfg_data["backend"],
-                model_name=cfg_data["model_name"],
-                api_key=cfg_data.get("api_key"),
-                nvidia_nim_url=cfg_data.get("nvidia_nim_url"),
-                max_tokens=cfg_data.get("max_tokens"),
-                min_tokens=cfg_data.get("min_tokens"),
-                timeout=cfg_data.get("timeout", 900),
-            )
+            config = config_from_stored(stored[choice])
             print(f"\n  {GREEN}✓ Loaded stored config '{choice}'{RST}")
             print_highlight_key_val("Backend", config.backend)
             print_highlight_key_val("Model", config.model_name)
-            print_highlight_key_val("Max Tokens", str(config.max_tokens or "50000"))
+            print_highlight_key_val("Max Tokens", str(config.max_tokens or "model default"))
             return config
 
     # ── Backend selection ──
@@ -372,7 +374,7 @@ def setup_model() -> ModelConfig:
     elif backend == "openrouter":
         model_name = input(f"  {PURP_L}OpenRouter model (e.g. openai/gpt-4o, anthropic/claude-sonnet-4):{RST} ").strip()
     elif backend == "claude":
-        model_name = input(f"  {PURP_L}Claude model (e.g. claude-sonnet-4-20250514):{RST} ").strip() or "claude-sonnet-4-20250514"
+        model_name = input(f"  {PURP_L}Claude model (ENTER for claude-sonnet-5-5):{RST} ").strip() or "claude-sonnet-5-5"
     elif backend == "nvidia_nim":
         model_name = input(f"  {PURP_L}NVIDIA NIM model name (e.g. meta/llama3-70b-instruct, nvidia/llama-3.1-nemotron):{RST} ").strip()
 
@@ -383,38 +385,18 @@ def setup_model() -> ModelConfig:
     print(f"{PURP}├{'─' * 56}┤{RST}")
     print(f"{PURP}│{RST}  Set the maximum output tokens for this model.      {PURP}│{RST}")
     print(f"{PURP}│{RST}  Max tokens: capped at 50,000                       {PURP}│{RST}")
-    print(f"{PURP}│{RST}  Leave blank for default (50,000)                   {PURP}│{RST}")
+    print(f"{PURP}│{RST}  Leave blank to use the model's own limit           {PURP}│{RST}")
     print(f"{PURP}└{'─' * 56}┘{RST}")
 
+    # No default cap: a number above what the model allows makes some backends reject the request
     max_tokens: int | None = None
-    min_tokens: int | None = None
 
-    max_in = input(f"\n  {PURP_L}Maximum tokens (ENTER for 50000):{RST} ").strip()
-    if max_in.isdigit():
-        candidate = int(max_in)
-        if candidate > 50000:
+    max_in = input(f"\n  {PURP_L}Maximum tokens (ENTER for the model's default):{RST} ").strip()
+    if max_in.isdigit() and int(max_in) > 0:
+        max_tokens = int(max_in)
+        if max_tokens > 50000:
             print(f"  {YELLOW}⚠ Max tokens capped at 50,000. Setting to 50000.{RST}")
             max_tokens = 50000
-        else:
-            max_tokens = candidate
-    else:
-        max_tokens = 50000
-
-    print()
-    min_in = input(f"  {PURP_L}Minimum tokens (ENTER for 2000):{RST} ").strip()
-    if min_in.isdigit():
-        candidate = int(min_in)
-        if candidate < 2000:
-            print(f"  {YELLOW}⚠ Min tokens must be >= 2000. Setting to 2000.{RST}")
-            min_tokens = 2000
-        else:
-            min_tokens = candidate
-    else:
-        min_tokens = 2000
-
-    if min_tokens and max_tokens and min_tokens > max_tokens:
-        print(f"  {YELLOW}⚠ Min tokens ({min_tokens}) > max tokens ({max_tokens}). Swapping.{RST}")
-        min_tokens, max_tokens = max_tokens, min_tokens
 
     config = ModelConfig(
         backend=backend,
@@ -422,7 +404,6 @@ def setup_model() -> ModelConfig:
         api_key=api_key or None,
         nvidia_nim_url=nvidia_nim_url,
         max_tokens=max_tokens,
-        min_tokens=min_tokens,
     )
 
     # ── Store config? ──
@@ -436,7 +417,6 @@ def setup_model() -> ModelConfig:
             "api_key": api_key or None,
             "nvidia_nim_url": nvidia_nim_url,
             "max_tokens": max_tokens,
-            "min_tokens": min_tokens,
         }
         save_stored_configs(stored)
         print(f"\n  {GREEN}✓ Saved as '{cfg_name}'{RST}")
@@ -457,65 +437,12 @@ def print_completion_block(usage: LLMUsage):
     print(f"{PURP}├{'─' * 50}┤{RST}")
     print(f"{PURP}│{RST}  {PURP_L}⏱ Time:{RST}  {WHITE}{mins}m {secs}s{RST}" + " " * (34 - len(f"{mins}m {secs}s")) + f"{PURP}│{RST}")
     if usage.total_tokens:
-        # A backend can report one count without the other (Ollama leaves out the input count for a cached prompt)
+        # A backend can report one count without the other
         tokens_in = "?" if usage.input_tokens is None else f"{usage.input_tokens:,}"
         tokens_out = "?" if usage.output_tokens is None else f"{usage.output_tokens:,}"
         print(f"{PURP}│{RST}  {PURP_L}🔢 Tokens:{RST} {WHITE}{usage.total_tokens:,}{RST} (in: {tokens_in} | out: {tokens_out})" + " " * 5 + f"{PURP}│{RST}")
     print(f"{PURP}└{'─' * 50}┘{RST}")
     print()
-
-
-def is_conversational(user_input: str) -> bool:
-    """Heuristic to detect if the user is just chatting vs asking for a command."""
-    lower = user_input.strip().lower()
-    chat_starters = (
-        # Pure Q&A / learning
-        "what is", "what are", "explain", "how does", "why is", "why does",
-        "can you explain", "tell me about", "who is", "when", "where", "describe",
-        "define", "meaning of", "difference between", "what's",
-        "help me understand", "i want to understand", "i'm trying to learn",
-        "teach me", "what are the",
-        "is it possible to", "should i", "recommend", "suggest", "compare",
-        "which is better", "pros and cons", "advice", "opinion", "thoughts on",
-        "what do you think", "i need help",
-        # Greetings & social
-        "hi", "hello", "hey", "yo", "good morning", "good afternoon", "good evening",
-        "thanks", "thank you", "goodbye", "bye", "see you", "cya", "good night",
-        "who are you", "what can you do", "what do you do", "what's your name",
-        "how are you", "what's up", "sup", "howdy", "how's it going",
-        # Emotional / casual
-        "i'm tired", "i'm bored", "i'm sad", "i'm happy", "i'm frustrated",
-        "i feel", "lol", "haha", "nice", "cool", "awesome", "wow",
-        "talk to me", "chat with me",
-        # Meta questions
-        "what model", "which model", "what llm",
-        "what is the", "what does", "can i ask",
-    )
-    # Normalize contractions so "i am" matches "i'm" starters
-    normalized = lower.replace("i am ", "i'm ").replace("i am", "i'm")
-    if normalized.startswith(chat_starters):
-        return True
-    if lower.endswith("?"):
-        return True
-    # Short emotional / greeting messages (1-2 words)
-    if len(lower.split()) <= 2 and lower in {
-        "hi", "hello", "hey", "yo", "thanks", "bye", "ok", "okay", "cool",
-        "nice", "wow", "lol", "haha", "yes", "no", "maybe", "sure", "yep", "nope",
-        "good", "great", "awesome", "perfect",
-    }:
-        return True
-    return False
-
-
-def chat_reply(user_inp: str, config: ModelConfig, history: list[ChatMessage]) -> tuple[str, LLMUsage] | None:
-    """Get a conversational reply from the model. Returns None on API failure."""
-    prompt = build_chat_prompt(user_inp, ShellContext(cwd=os.getcwd(), env=dict(os.environ), os_name="windows" if os.name == "nt" else "linux"), history)
-    try:
-        reply, _, usage = ask_model_text(prompt, config, history)
-    except LLMError as e:
-        _handle_api_error(e, config)
-        return None
-    return reply, usage
 
 
 def _handle_api_error(error: LLMError, config: ModelConfig):
@@ -543,19 +470,28 @@ def _handle_api_error(error: LLMError, config: ModelConfig):
 MAX_REPAIRS = 3
 
 
-def _with_spinner(ask, prompt: str, config: ModelConfig, history: list[ChatMessage]) -> tuple:
+# How much of each command's output is kept in the history the model sees
+HISTORY_OUTPUT_CHARS = 500
+
+
+def _with_spinner(ask, prompt: str, config: ModelConfig) -> tuple:
     spinner_start()
     try:
-        return ask(prompt, config, history)
+        return ask(prompt, config)
     finally:
         spinner_stop()
 
 
-def _commands(plan_dict: dict) -> list[str]:
+def _say(reply: str):
+    # No purple box for chat replies - just plain text
+    print()
+    print(f"  {BOLD}{PURP_L}🦊 ploxv1 says:{RST}")
+    print(f"  {reply}")
+
+
+def _commands(answer: dict) -> list[str]:
     """The plan's commands as a clean list. Small models don't always send a list of strings."""
-    if "error" in plan_dict:
-        return []
-    commands = plan_dict.get("commands", [])
+    commands = answer.get("commands", [])
     if isinstance(commands, str):
         commands = [commands]
     if not isinstance(commands, list):
@@ -563,67 +499,54 @@ def _commands(plan_dict: dict) -> list[str]:
     return [c.strip() for c in commands if isinstance(c, str) and c.strip()]
 
 
-def _ask_for_plan(
-    prompt: str, config: ModelConfig, history: list[ChatMessage], *, is_repair: bool
-) -> tuple[CommandPlan | None, LLMUsage | None]:
-    """Ask the model for a plan. When it can't give one, say why and return no plan."""
+def _read_answer(answer: dict) -> CommandPlan | str | None:
+    """Turn the model's JSON into a plan to run or a reply to show. None when it is neither."""
+    if "error" in answer:
+        # Not JSON. A mangled plan is unusable; anything else is the model answering in plain text.
+        raw = answer["raw"].strip()
+        return None if '"commands"' in raw else (raw or None)
+
+    commands = _commands(answer)
+    if commands:
+        return CommandPlan(
+            summary=str(answer.get("summary") or "No summary"),
+            commands=commands,
+            requires_confirmation=bool(answer.get("requires_confirmation", True)),
+        )
+
+    reply = answer.get("reply")
+    return reply.strip() if isinstance(reply, str) and reply.strip() else None
+
+
+def _ask_model(prompt: str, config: ModelConfig, *, is_repair: bool) -> tuple[CommandPlan | str | None, LLMUsage | None]:
+    """Ask the model what to do. Returns a plan to run or a reply to show,
+    or None (with the reason already printed) when it gave neither."""
     try:
-        return _plan_from_model(prompt, config, history, is_repair=is_repair)
+        answer, _, usage = _with_spinner(ask_model_json, prompt, config)
+        result = _read_answer(answer)
+
+        if result is None and not is_repair:
+            said = answer["raw"] if "error" in answer else json.dumps(answer)
+            retry_prompt = (
+                prompt
+                + f"\n\n!!! YOUR LAST ANSWER COULD NOT BE USED. You said:\n{said[:300]}\n\n"
+                + "NOW OUTPUT ONLY THE JSON OBJECT: either commands or a reply. No markdown. No backticks."
+            )
+            answer, _, usage = _with_spinner(ask_model_json, retry_prompt, config)
+            result = _read_answer(answer)
     except LLMError as e:
         _handle_api_error(e, config)
         return None, None
 
-
-def _plan_from_model(
-    prompt: str, config: ModelConfig, history: list[ChatMessage], *, is_repair: bool
-) -> tuple[CommandPlan | None, LLMUsage | None]:
-    plan_dict, _, usage = _with_spinner(ask_model_json, prompt, config, history)
-
-    if "error" in plan_dict and not is_repair:
-        retry_prompt = (
-            prompt
-            + f"\n\n!!! YOUR LAST RESPONSE WAS NOT VALID JSON. You said:\n{plan_dict.get('raw', '')[:300]}\n\n"
-            + "NOW OUTPUT ONLY VALID JSON. No markdown. No backticks. No explanation. ONLY the JSON object."
-        )
-        plan_dict, _, usage = _with_spinner(ask_model_json, retry_prompt, config, history)
-
-    if "error" in plan_dict:
-        raw_text = plan_dict.get("raw", "")
-        print(f"\n  {BRIGHT_RED}✗ Model didn't return valid JSON after retry.{RST}")
-        if raw_text:
-            print(f"  {GREY}Raw: {raw_text[:300]}{RST}")
-        if not is_repair:
-            print_completion_block(usage)
-        return None, usage
-
-    commands = _commands(plan_dict)
-
-    if not commands and not is_repair:
-        retry_prompt = (
-            prompt
-            + "\n\n!!! You returned valid JSON but 'commands' was EMPTY. "
-            + "Populate it with real shell commands the user needs."
-        )
-        plan_dict, _, usage = _with_spinner(ask_model_json, retry_prompt, config, history)
-        commands = _commands(plan_dict)
-
-    if not commands:
-        summary = plan_dict.get("summary", "No plan generated.") if "error" not in plan_dict else "No plan generated."
-        print()
-        print(f"  {BOLD}{YELLOW}⚠ Could not generate commands:{RST} {summary}")
+    if result is None:
+        print(f"\n  {BOLD}{YELLOW}⚠ The model gave no commands and no answer.{RST}")
         print_completion_block(usage)
-        return None, usage
+    return result, usage
 
-    plan = CommandPlan(
-        domain=plan_dict.get("domain", "linux"),
-        action=plan_dict.get("action", "unknown"),
-        summary=plan_dict.get("summary", "No summary"),
-        commands=commands,
-        requires_confirmation=plan_dict.get("requires_confirmation", True),
-        resolved_path=plan_dict.get("resolved_path"),
-        warnings=plan_dict.get("warnings", []),
-    )
-    return plan, usage
+
+def _transcript(results: list[CommandExecutionResult]) -> str:
+    """What ran and the end of what it printed, so the model can answer questions about it."""
+    return "\n".join(f"$ {r.command}\n{r.output.strip()[-HISTORY_OUTPUT_CHARS:]}".rstrip() for r in results)
 
 
 def _show_plan(plan: CommandPlan):
@@ -637,10 +560,7 @@ def _show_plan(plan: CommandPlan):
         label_color, label = BRIGHT_GREEN, "✓ SAFE"
 
     print()
-    print(f"  {BOLD}{PURP_L}📋 PLAN: {plan.action}{RST}")
-    print(f"  {BLUE}Domain:{RST} {plan.domain}")
-    print()
-    print(f"  {PURP_L}Summary:{RST} {plan.summary}")
+    print(f"  {BOLD}{PURP_L}📋 PLAN: {plan.summary}{RST}")
     print()
     print(f"  {CYAN}Commands to run:{RST}")
     for c in plan.commands:
@@ -648,12 +568,6 @@ def _show_plan(plan: CommandPlan):
             print(f"    {BRIGHT_RED}$ {c}  ⚠{RST}")
         else:
             print(f"    {BRIGHT_BLUE}$ {c}{RST}")
-
-    if plan.warnings:
-        print()
-        print(f"  {BRIGHT_YELLOW}⚠ Warnings:{RST}")
-        for w in plan.warnings:
-            print(f"    {YELLOW}• {w}{RST}")
 
     print(f"\n  {label_color}{label}{RST}")
 
@@ -697,24 +611,21 @@ def _confirm_plan(plan: CommandPlan, auto_confirm: bool) -> tuple[str, bool]:
         return "cancel", auto_confirm
 
 
-def _run_plan(plan: CommandPlan, context: ShellContext) -> CommandExecutionResult | None:
-    """Run the commands in order. Returns the first failed result, or None when all passed."""
+def _run_plan(plan: CommandPlan, context: ShellContext) -> list[CommandExecutionResult]:
+    """Run the commands in order, stopping at the first one that fails. Returns what ran."""
     print(f"\n  {SPINNER_BLUE}⚡ Executing...{RST}")
+    results = []
     for i, cmd in enumerate(plan.commands):
         print(f"  {BRIGHT_BLUE}[{i+1}/{len(plan.commands)}]{RST} $ {cmd}")
-        result = run_single_command(cmd)
+        # Output is printed line by line as the command runs
+        result = run_single_command(cmd, on_line=lambda line: print(f"  {DIM}  | {line}{RST}"))
+        results.append(result)
 
         if result.returncode != 0:
             print(f"  {BRIGHT_RED}  ✗ FAILED (code {result.returncode}){RST}")
-            if result.stderr.strip():
-                for line in result.stderr.strip().split("\n")[:5]:
-                    print(f"  {RED}  | {line}{RST}")
-            return result
+            break
 
-        if result.stdout.strip():
-            for line in result.stdout.strip().split("\n")[:10]:
-                print(f"  {DIM}  | {line}{RST}")
-        else:
+        if not result.output.strip():
             print(f"  {GREEN}  ✓ OK{RST}")
 
         # A lone `cd` only moved the child shell, so move ploxv1 itself there too.
@@ -727,45 +638,27 @@ def _run_plan(plan: CommandPlan, context: ShellContext) -> CommandExecutionResul
                 context.cwd = os.getcwd()
             except OSError as e:
                 print(f"  {YELLOW}  ⚠ Could not follow cd: {e}{RST}")
-    return None
+    return results
 
 
 def _handle_request(user_inp: str, config: ModelConfig, context: ShellContext, history: list[ChatMessage]):
     """Answer one request: a chat reply, or a plan that is confirmed, run and repaired."""
+    # The model decides whether this is a question to answer or a task to run
+    prompt = build_prompt(user_inp, context, history)
     history.append(ChatMessage(role="user", content=user_inp))
-
-    # ── Detect chat vs command ──
-    if is_conversational(user_inp):
-        # ── CHAT PATH ──
-        spinner_start()
-        try:
-            result = chat_reply(user_inp, config, history)
-        finally:
-            spinner_stop()
-
-        if result is None:
-            # API error already printed by chat_reply, just skip
-            return
-
-        reply, usage = result
-        history.append(ChatMessage(role="assistant", content=reply))
-
-        # No purple box for chat replies - just plain text
-        print()
-        print(f"  {BOLD}{PURP_L}🦊 ploxv1 says:{RST}")
-        print(f"  {reply}")
-        print_completion_block(usage)
-        return
-
-    # ── COMMAND PATH ──
-    prompt = build_command_prompt(user_inp, context, history)
     repairs = 0
     # Auto-confirm lasts for one task
     auto_confirm = False
 
     while True:
-        plan, usage = _ask_for_plan(prompt, config, history, is_repair=repairs > 0)
+        plan, usage = _ask_model(prompt, config, is_repair=repairs > 0)
         if plan is None:
+            break
+
+        if isinstance(plan, str):
+            _say(plan)
+            history.append(ChatMessage(role="assistant", content=plan))
+            print_completion_block(usage)
             break
 
         decision, auto_confirm = _confirm_plan(plan, auto_confirm)
@@ -780,24 +673,19 @@ def _handle_request(user_inp: str, config: ModelConfig, context: ShellContext, h
             # Switch to chat mode - NO PURPLE BOX for chat
             chat_prompt = f"The user saw this plan and wants to chat instead:\n\nPlan: {plan.summary}\nCommands: {', '.join(plan.commands)}\n\nUser said: {user_inp}\n\nHave a conversation about this. Explain what the commands do, suggest alternatives, answer questions."
             try:
-                reply, _, chat_usage = _with_spinner(ask_model_text, chat_prompt, config, history)
+                reply, _, chat_usage = _with_spinner(ask_model_text, chat_prompt, config)
             except LLMError as e:
                 _handle_api_error(e, config)
                 break
-            print()
-            print(f"  {BOLD}{PURP_L}🦊 ploxv1 says:{RST}")
-            print(f"  {reply}")
+            _say(reply)
             history.append(ChatMessage(role="assistant", content=reply))
             print_completion_block(chat_usage)
             break
 
-        failed = _run_plan(plan, context)
+        results = _run_plan(plan, context)
 
-        if failed is None:
-            history.append(ChatMessage(
-                role="assistant",
-                content=f"[Executed plan: {plan.action}]\nCommands:\n" + "\n".join(f"  $ {c}" for c in plan.commands)
-            ))
+        if results[-1].returncode == 0:
+            history.append(ChatMessage(role="assistant", content=f"[Ran: {plan.summary}]\n{_transcript(results)}"))
             print_completion_block(usage)
             break
 
@@ -814,11 +702,11 @@ def _handle_request(user_inp: str, config: ModelConfig, context: ShellContext, h
 
         if repair_choice not in ("y", "yes", ""):
             print(f"  {YELLOW}✗ Abandoned.{RST}")
-            history.append(ChatMessage(role="assistant", content=f"[Plan failed and was abandoned]: {plan.summary}"))
+            history.append(ChatMessage(role="assistant", content=f"[Failed and abandoned: {plan.summary}]\n{_transcript(results)}"))
             break
 
         repairs += 1
-        prompt = build_repair_prompt(user_inp, plan, failed, context)
+        prompt = build_repair_prompt(user_inp, plan, results[-1], context)
     # End of while True (command loop)
 
     if auto_confirm:
@@ -828,14 +716,15 @@ def _handle_request(user_inp: str, config: ModelConfig, context: ShellContext, h
 def repl_loop(config: ModelConfig):
     context = ShellContext(
         cwd=os.getcwd(),
-        env=dict(os.environ),
         os_name="windows" if os.name == "nt" else "linux",
+        aws_profile=os.environ.get("AWS_PROFILE"),
+        aws_region=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"),
     )
     history: list[ChatMessage] = []
 
     print_highlight_key_val("Backend", config.backend, PURP_L, WHITE)
     print_highlight_key_val("Model", config.model_name, PURP_L, WHITE)
-    print_highlight_key_val("Max Tokens", str(config.max_tokens or "50000"), PURP_L, WHITE)
+    print_highlight_key_val("Max Tokens", str(config.max_tokens or "model default"), PURP_L, WHITE)
     print()
     print(f"  {DIM}Type /help for commands, /exit to quit, /clear to reset history{RST}")
     print(f"  {DIM}You can chat naturally OR ask me to do terminal tasks!{RST}")
@@ -878,7 +767,7 @@ def repl_loop(config: ModelConfig):
             elif cmd == "config":
                 print_highlight_key_val("Backend", config.backend)
                 print_highlight_key_val("Model", config.model_name)
-                print_highlight_key_val("Max Tokens", str(config.max_tokens or "50000"))
+                print_highlight_key_val("Max Tokens", str(config.max_tokens or "model default"))
                 if config.nvidia_nim_url:
                     print_highlight_key_val("NIM URL", config.nvidia_nim_url)
                 continue
@@ -893,16 +782,7 @@ def repl_loop(config: ModelConfig):
                 list_stored_configs()
                 name = input(f"\n  {PURP_L}Config name to switch to:{RST} ").strip()
                 if name in stored:
-                    cfg = stored[name]
-                    config = ModelConfig(
-                        backend=cfg["backend"],
-                        model_name=cfg["model_name"],
-                        api_key=cfg.get("api_key"),
-                        nvidia_nim_url=cfg.get("nvidia_nim_url"),
-                        max_tokens=cfg.get("max_tokens"),
-                        min_tokens=cfg.get("min_tokens"),
-                        timeout=cfg.get("timeout", 900),
-                    )
+                    config = config_from_stored(stored[name])
                     history = []
                     print(f"\n  {GREEN}✓ Switched to '{name}'. History cleared.{RST}")
                 else:

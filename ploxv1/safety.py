@@ -50,6 +50,7 @@ SAFE_READ_ONLY = [
     r"^env$", r"^printenv\b",
     r"^awk\b", r"^sed\b",
     r"^sort\b", r"^uniq\b", r"^wc\b",
+    r"^ss\b", r"^netstat\b", r"^lsof\b",
     r"^docker\s+(ps|images|logs|inspect|version|info)\b",
     r"^git\s+(status|log|diff|show)\b",
     r"^kubectl\s+(get|describe|logs)\b",

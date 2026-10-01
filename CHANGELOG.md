@@ -24,6 +24,23 @@
 - **The summary box copes with a missing token count.**
 - **An empty reply or an error body from OpenRouter / NIM is reported**, not a `KeyError`.
 
+### Behaviour
+- **The model decides between answering and running.** A word list used to guess, and sent real tasks to chat: anything ending in `?`, or starting with "hi" (hide, history), "describe", "what's", "where". Chat could not run anything. Now one prompt lets the model answer with commands or with a reply.
+- **Command output is shown live and in full.** It used to appear only when the command ended, cut to 10 lines.
+- **The end of each command's output is kept in the history**, so "what does that mean?" works.
+- **Commands get no keyboard.** `top`, or a `[Y/n]` prompt, used to hang on a blank screen. They now fail at once, and Ctrl+C stops a long command.
+- **PowerShell output is read as UTF-8.**
+- **The prompt's JSON examples had doubled braces** (`{{"commands": ...}}`), left over from an f-string. The model saw them as written.
+- **The prompt no longer bans package managers**, so "install nginx" works. It also no longer tells the model to guess the OS; the OS is given.
+- **History is sent once.** It went out twice (as chat messages and again inside the prompt), and on Ollama the system prompt went out twice. The Claude backend would also have been sent a history starting with an assistant message once it passed 10 messages.
+- **Ollama chat was told "Only output valid JSON".** The two branches were the wrong way round. Ollama's JSON mode is now used for plans.
+- **Temperature is fixed at 0** for Ollama, OpenRouter and NIM, to keep answers steady.
+- **`--min-tokens` is gone.** It forced a floor of 2,000 output tokens on backends that honour it, for answers that are one line of JSON.
+- **No default token cap.** The default was 50,000, which is above what many models accept. Blank now means the model's own limit (4,096 for Claude, which needs a number).
+- **The plan header shows the summary.** It always said "PLAN: unknown / Domain: linux" because the prompt never asked for those fields.
+- **AWS profile and region are read from the environment** and shown to the model. The fields existed but were never filled.
+- **Default Claude model is `claude-sonnet-5-5`.**
+
 ## 2.0.0
 
 ### Security

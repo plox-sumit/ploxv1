@@ -56,7 +56,11 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 export NVIDIA_NIM_API_KEY="nvapi-..."
 ```
 
+A key passed with `--api-key` or saved in a config is used first. A NIM container you run yourself (`--nvidia-nim-url http://localhost:8000/v1/chat/completions`) needs no key.
+
 ## How to Use
+
+Just type. The model works out whether you asked a question or want something done, so "what's using port 8080?" gets a command and "what is docker?" gets an answer.
 
 ### Chat
 ```
@@ -70,17 +74,23 @@ Docker is a tool that packages software into containers...
 ```
 🦊 You: list all running containers
 
-  📋 PLAN: list running containers
-  Domain: linux
-  Summary: List all Docker containers
+  📋 PLAN: List all running Docker containers
+
   Commands to run:
     $ docker ps
 
   ✓ SAFE
-
   [Y] = Run it  [N] = Cancel  [E] = Edit  [C] = Chat  [A] = Yes to ALL this task
   ▶ y
+
+  ⚡ Executing...
+  [1/1] $ docker ps
+    | CONTAINER ID   IMAGE   COMMAND   CREATED   STATUS   PORTS   NAMES
 ```
+
+Output is shown line by line while the command runs, and PloxV1 remembers the end of it, so you can ask "what does that mean?" next. Press Ctrl+C to stop a command that is taking too long.
+
+Commands can't ask you questions while they run. A command that needs typing (a `[Y/n]` prompt, an editor) fails straight away, so ask for the non-interactive form, such as `apt-get install -y`.
 
 ### Slash Commands
 
