@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Safety
+- **WSL runs commands in bash again.** The shell was picked by what is installed, and WSL has `powershell.exe` on its PATH, so Linux commands were sent to Windows PowerShell.
+- **Only `y` / `yes` runs a plan.** Enter, a typo or any other answer used to run it.
+- **The safety label comes from PloxV1's own check**, not from the model's `requires_confirmation` flag.
+- **The checker looks at the whole command.** `ls && rm -rf x`, `echo x > file`, `find -delete`, `sed -i`, `curl ... | sh` and `git push -f` are now flagged.
+- **Yes to ALL still asks before destructive commands**, and auto-repair stops after 3 tries.
+- **Saying no to a repair stops the task.** A second "no" used to be ignored.
+- **Edit keeps your edit.** It used to ask the model for a new plan and throw the edit away.
+- Added tests and a GitHub Actions workflow that runs them on Linux and Windows.
+
+## 2.0.0
 
 ### Security
 - **Replaced `shell=True`** with safe `subprocess.run(args, shell=False)` to prevent shell injection.
