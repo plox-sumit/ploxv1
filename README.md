@@ -78,7 +78,7 @@ Docker is a tool that packages software into containers...
 
   ✓ SAFE
 
-  [Y] = Run it  [N] = Cancel  [C] = Chat  [A] = Yes to ALL this session
+  [Y] = Run it  [N] = Cancel  [E] = Edit  [C] = Chat  [A] = Yes to ALL this task
   ▶ y
 ```
 
@@ -100,7 +100,9 @@ When a plan is shown, you can:
 - **N** — Cancel
 - **E** — Edit a command
 - **C** — Chat about it
-- **A** — Yes to ALL (auto-confirm every step in this task)
+- **A** — Yes to ALL (auto-confirm the rest of this task; destructive commands still ask)
+
+Anything else, including just pressing Enter, cancels.
 
 ## Persistent Configs
 
@@ -114,9 +116,13 @@ ploxv1 --use-config my-server
 
 ## Safety
 
-- **Destructive commands** (`rm`, `sudo`, `dd`) require confirmation
-- **Read-only commands** (`ls`, `cat`, `grep`) run without asking
-- **Edited commands** are re-checked for safety
+- **Nothing runs until you say Y.** Every plan is shown first
+- **PloxV1 checks each command itself**, it does not take the AI's word for it:
+  - destructive commands (`rm`, `sudo`, `dd`, `>` into a file, `curl ... | sh`) are marked in red
+  - a plan is marked `✓ SAFE` only when every command is read-only (`ls`, `cat`, `grep`)
+- **Yes to ALL never covers destructive commands**
+- **Auto-repair stops after 3 tries**
+- **Edited commands** are checked again before they run
 - **API keys** stored in `~/.ploxv1_config.json` with `0o600` permissions (owner-only)
 
 ## File Overview

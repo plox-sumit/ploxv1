@@ -11,7 +11,7 @@ from .llm import ask_model_text, ask_model_json
 from .prompting import build_command_prompt, build_chat_prompt
 from .repair_prompting import build_repair_prompt
 from .executor import run_single_command
-from .safety import is_destructive
+from .safety import is_destructive, is_read_only
 
 # ── Terminal color codes ────────────────────────────────────────────
 RST = "\033[0m"
@@ -541,6 +541,176 @@ def _handle_api_error(err_text: str) -> bool:
     return False
 
 
+MAX_REPAIRS = 3
+
+
+def _ask_json(prompt: str, config: ModelConfig, history: list[ChatMessage]) -> tuple:
+    spinner_start()
+    try:
+        return ask_model_json(prompt, config, history)
+    finally:
+        spinner_stop()
+
+
+def _ask_for_plan(
+    prompt: str, config: ModelConfig, history: list[ChatMessage], *, is_repair: bool
+) -> tuple[CommandPlan | None, LLMUsage | None]:
+    """Ask the model for a plan. When it can't give one, say why and return no plan."""
+    try:
+        plan_dict, _, usage = _ask_json(prompt, config, history)
+    except RuntimeError as e:
+        _handle_api_error(str(e))
+        return None, None
+
+    if "error" in plan_dict and not is_repair:
+        retry_prompt = (
+            prompt
+            + f"\n\n!!! YOUR LAST RESPONSE WAS NOT VALID JSON. You said:\n{plan_dict.get('raw', '')[:300]}\n\n"
+            + "NOW OUTPUT ONLY VALID JSON. No markdown. No backticks. No explanation. ONLY the JSON object."
+        )
+        plan_dict, _, usage = _ask_json(retry_prompt, config, history)
+
+    if "error" in plan_dict:
+        raw_text = plan_dict.get("raw", "")
+        print(f"\n  {BRIGHT_RED}✗ Model didn't return valid JSON after retry.{RST}")
+        if raw_text:
+            print(f"  {GREY}Raw: {raw_text[:300]}{RST}")
+        if not is_repair:
+            print_completion_block(usage)
+        return None, usage
+
+    commands = plan_dict.get("commands", [])
+
+    if not commands and not is_repair:
+        retry_prompt = (
+            prompt
+            + "\n\n!!! You returned valid JSON but 'commands' was EMPTY. "
+            + "Populate it with real shell commands the user needs."
+        )
+        plan_dict, _, usage = _ask_json(retry_prompt, config, history)
+        commands = plan_dict.get("commands", []) if "error" not in plan_dict else []
+
+    if not commands:
+        summary = plan_dict.get("summary", "No plan generated.") if "error" not in plan_dict else "No plan generated."
+        print()
+        print(f"  {BOLD}{YELLOW}⚠ Could not generate commands:{RST} {summary}")
+        print_completion_block(usage)
+        return None, usage
+
+    plan = CommandPlan(
+        domain=plan_dict.get("domain", "linux"),
+        action=plan_dict.get("action", "unknown"),
+        summary=plan_dict.get("summary", "No summary"),
+        commands=commands,
+        requires_confirmation=plan_dict.get("requires_confirmation", True),
+        resolved_path=plan_dict.get("resolved_path"),
+        warnings=plan_dict.get("warnings", []),
+    )
+    return plan, usage
+
+
+def _show_plan(plan: CommandPlan):
+    # The label comes from our own check of the commands. The model can ask for
+    # confirmation, but it can't mark its own commands as safe.
+    if any(is_destructive(c) for c in plan.commands):
+        label_color, label = BRIGHT_RED, "⚠ DESTRUCTIVE — this can delete or overwrite things"
+    elif plan.requires_confirmation or not all(is_read_only(c) for c in plan.commands):
+        label_color, label = BRIGHT_YELLOW, "⚠ NEEDS CONFIRMATION"
+    else:
+        label_color, label = BRIGHT_GREEN, "✓ SAFE"
+
+    print()
+    print(f"  {BOLD}{PURP_L}📋 PLAN: {plan.action}{RST}")
+    print(f"  {BLUE}Domain:{RST} {plan.domain}")
+    print()
+    print(f"  {PURP_L}Summary:{RST} {plan.summary}")
+    print()
+    print(f"  {CYAN}Commands to run:{RST}")
+    for c in plan.commands:
+        if is_destructive(c):
+            print(f"    {BRIGHT_RED}$ {c}  ⚠{RST}")
+        else:
+            print(f"    {BRIGHT_BLUE}$ {c}{RST}")
+
+    if plan.warnings:
+        print()
+        print(f"  {BRIGHT_YELLOW}⚠ Warnings:{RST}")
+        for w in plan.warnings:
+            print(f"    {YELLOW}• {w}{RST}")
+
+    print(f"\n  {label_color}{label}{RST}")
+
+
+def _confirm_plan(plan: CommandPlan, auto_confirm: bool) -> tuple[str, bool]:
+    """Show the plan and ask what to do with it.
+    Returns ('run' | 'cancel' | 'chat', auto_confirm)."""
+    while True:
+        _show_plan(plan)
+
+        destructive = any(is_destructive(c) for c in plan.commands)
+        if auto_confirm and not destructive:
+            print(f"  {DIM}[Auto-confirm: Yes to all]{RST}")
+            return "run", auto_confirm
+        if auto_confirm:
+            print(f"  {DIM}[Auto-confirm does not cover destructive commands]{RST}")
+
+        print(f"  {BRIGHT_GREEN}[Y]{RST} = Run it  {BRIGHT_RED}[N]{RST} = Cancel  {YELLOW}[E]{RST} = Edit  {PURP_L}[C]{RST} = Chat  {BRIGHT_GREEN}[A]{RST} = Yes to ALL this task")
+        decision = input(f"  {PURP_L}▶{RST} ").strip().lower()
+
+        if decision in ("y", "yes"):
+            return "run", auto_confirm
+        if decision == "a":
+            print(f"  {GREEN}✓ Auto-confirm enabled for this task. Only destructive steps will ask again.{RST}")
+            return "run", True
+        if decision == "c":
+            return "chat", auto_confirm
+        if decision == "e":
+            print(f"\n  {PURP_L}Commands to edit:{RST}")
+            for i, c in enumerate(plan.commands):
+                print(f"  {BRIGHT_BLUE}[{i}]{RST} {c}")
+            idx = input(f"  {PURP_L}Which command number to edit?{RST} ").strip()
+            if idx.isdigit() and int(idx) < len(plan.commands):
+                new_cmd = input(f"  {PURP_L}New command:{RST} ").strip()
+                if new_cmd:
+                    plan.commands[int(idx)] = new_cmd
+                    print(f"  {GREEN}✓ Updated.{RST}")
+            # Show the plan again, with the safety label worked out for the edited command
+            continue
+        # Anything that is not a clear yes is a no
+        return "cancel", auto_confirm
+
+
+def _run_plan(plan: CommandPlan, context: ShellContext) -> CommandExecutionResult | None:
+    """Run the commands in order. Returns the first failed result, or None when all passed."""
+    print(f"\n  {SPINNER_BLUE}⚡ Executing...{RST}")
+    for i, cmd in enumerate(plan.commands):
+        print(f"  {BRIGHT_BLUE}[{i+1}/{len(plan.commands)}]{RST} $ {cmd}")
+        result = run_single_command(cmd)
+
+        if result.returncode != 0:
+            print(f"  {BRIGHT_RED}  ✗ FAILED (code {result.returncode}){RST}")
+            if result.stderr.strip():
+                for line in result.stderr.strip().split("\n")[:5]:
+                    print(f"  {RED}  | {line}{RST}")
+            return result
+
+        if result.stdout.strip():
+            for line in result.stdout.strip().split("\n")[:10]:
+                print(f"  {DIM}  | {line}{RST}")
+        else:
+            print(f"  {GREEN}  ✓ OK{RST}")
+
+        # Update context.cwd if it was a cd command
+        if cmd.strip().startswith("cd "):
+            new_dir = cmd.strip()[3:].strip()
+            if os.path.isabs(new_dir):
+                context.cwd = new_dir
+            else:
+                context.cwd = os.path.normpath(os.path.join(context.cwd, new_dir))
+            os.chdir(context.cwd)
+    return None
+
+
 def repl_loop(config: ModelConfig):
     context = ShellContext(
         cwd=os.getcwd(),
@@ -657,146 +827,23 @@ def repl_loop(config: ModelConfig):
             continue
 
         # ── COMMAND PATH ──
-        is_repair = False
-        failed_plan: CommandPlan | None = None
-        failed_result: CommandExecutionResult | None = None
+        prompt = build_command_prompt(user_inp, context, history)
+        repairs = 0
 
         while True:
-            # Build prompt
-            if is_repair:
-                prompt = build_repair_prompt(user_inp, failed_plan, failed_result, context)
-            else:
-                prompt = build_command_prompt(user_inp, context, history)
-
-            # Call model with error handling
-            spinner_start()
-            plan_dict = None
-            reasoning = None
-            usage = None
-
-            try:
-                plan_dict, reasoning, usage = ask_model_json(prompt, config, history)
-            except RuntimeError as e:
-                spinner_stop()
-                _handle_api_error(str(e))
+            plan, usage = _ask_for_plan(prompt, config, history, is_repair=repairs > 0)
+            if plan is None:
                 break
-            finally:
-                if _spinner_running:
-                    spinner_stop()
 
-            if plan_dict is None or "error" in plan_dict:
-                if not is_repair:
-                    raw_text = plan_dict.get("raw", "") if plan_dict else ""
-                    retry_prompt = (
-                        prompt
-                        + f"\n\n!!! YOUR LAST RESPONSE WAS NOT VALID JSON. You said:\n{raw_text[:300]}\n\n"
-                        + "NOW OUTPUT ONLY VALID JSON. No markdown. No backticks. No explanation. ONLY the JSON object."
-                    )
-                    spinner_start()
-                    try:
-                        plan_dict, reasoning, usage2 = ask_model_json(retry_prompt, config, history)
-                        if usage2:
-                            usage = usage2
-                    finally:
-                        spinner_stop()
+            decision, auto_confirm = _confirm_plan(plan, auto_confirm)
 
-                if plan_dict is None or "error" in plan_dict:
-                    raw_text = plan_dict.get("raw", "") if plan_dict else ""
-                    print(f"\n  {BRIGHT_RED}✗ Model didn't return valid JSON after retry.{RST}")
-                    if raw_text:
-                        print(f"  {GREY}Raw: {raw_text[:300]}{RST}")
-                    if not is_repair:
-                        print_completion_block(usage)
-                    break
-
-            if reasoning:
-                plan_dict["reasoning_details"] = reasoning
-
-            commands = plan_dict.get("commands", [])
-
-            if not commands:
-                if not is_repair:
-                    retry_prompt = (
-                        prompt
-                        + "\n\n!!! You returned valid JSON but 'commands' was EMPTY. "
-                        + "Populate it with real shell commands the user needs."
-                    )
-                    spinner_start()
-                    try:
-                        plan_dict, reasoning, usage2 = ask_model_json(retry_prompt, config, history)
-                        if usage2:
-                            usage = usage2
-                    finally:
-                        spinner_stop()
-                    commands = plan_dict.get("commands", []) if plan_dict and "error" not in plan_dict else []
-
-                if not commands:
-                    summary = plan_dict.get("summary", "No plan generated.") if plan_dict and "error" not in plan_dict else "No plan generated."
-                    print()
-                    print(f"  {BOLD}{YELLOW}⚠ Could not generate commands:{RST} {summary}")
-                    print_completion_block(usage)
-                    break
-
-            plan = CommandPlan(
-                domain=plan_dict.get("domain", "linux"),
-                action=plan_dict.get("action", "unknown"),
-                summary=plan_dict.get("summary", "No summary"),
-                commands=commands,
-                requires_confirmation=plan_dict.get("requires_confirmation", True),
-                resolved_path=plan_dict.get("resolved_path"),
-                warnings=plan_dict.get("warnings", []),
-            )
-
-            # Show plan - NO PURPLE BOX, just plain text with colors
-            summary_color = BRIGHT_RED if plan.requires_confirmation else BRIGHT_GREEN
-            confirm_label = "⚠ NEEDS CONFIRMATION" if plan.requires_confirmation else "✓ SAFE"
-
-            print()
-            print(f"  {BOLD}{PURP_L}📋 PLAN: {plan.action}{RST}")
-            print(f"  {BLUE}Domain:{RST} {plan.domain}")
-            print()
-            print(f"  {PURP_L}Summary:{RST} {plan.summary}")
-            print()
-            print(f"  {CYAN}Commands to run:{RST}")
-            for c in plan.commands:
-                print(f"    {BRIGHT_BLUE}$ {c}{RST}")
-
-            if plan.warnings:
-                print()
-                print(f"  {BRIGHT_YELLOW}⚠ Warnings:{RST}")
-                for w in plan.warnings:
-                    print(f"    {YELLOW}• {w}{RST}")
-
-            print(f"\n  {summary_color}{confirm_label}{RST}")
-
-            if plan.requires_confirmation:
-                if not auto_confirm:
-                    print(f"  {BRIGHT_GREEN}[Y]{RST} = Run it  {BRIGHT_RED}[N]{RST} = Cancel  {YELLOW}[E]{RST} = Edit  {PURP_L}[C]{RST} = Chat  {BRIGHT_GREEN}[A]{RST} = Yes to ALL this session")
-                    decision = input(f"  {PURP_L}▶{RST} ").strip().lower()
-                else:
-                    # Already in auto-confirm mode
-                    decision = "y"
-                    print(f"  {DIM}[Auto-confirm: Yes to all]{RST}")
-            else:
-                if not auto_confirm:
-                    print(f"  {BRIGHT_GREEN}[Y]{RST} = Run it  {BRIGHT_RED}[N]{RST} = Cancel  {PURP_L}[C]{RST} = Chat  {BRIGHT_GREEN}[A]{RST} = Yes to ALL")
-                    decision = input(f"  {PURP_L}▶{RST} ").strip().lower()
-                else:
-                    decision = "y"
-                    print(f"  {DIM}[Auto-confirm: Yes to all]{RST}")
-
-            if decision in ("n", "no"):
+            if decision == "cancel":
                 print(f"  {YELLOW}✗ Cancelled.{RST}")
                 history.append(ChatMessage(role="assistant", content=f"[Plan was shown but user cancelled]: {plan.summary}"))
                 print_completion_block(usage)
                 break
 
-            if decision == "a":
-                auto_confirm = True
-                print(f"  {GREEN}✓ Auto-confirm enabled for this task. All steps will run without asking.{RST}")
-                decision = "y"
-
-            if decision == "c":
+            if decision == "chat":
                 # Switch to chat mode - NO PURPLE BOX for chat
                 chat_prompt = f"The user saw this plan and wants to chat instead:\n\nPlan: {plan.summary}\nCommands: {', '.join(plan.commands)}\n\nUser said: {user_inp}\n\nHave a conversation about this. Explain what the commands do, suggest alternatives, answer questions."
                 spinner_start()
@@ -811,78 +858,34 @@ def repl_loop(config: ModelConfig):
                 print_completion_block(chat_usage)
                 break
 
-            if decision == "e" and plan.requires_confirmation:
-                print(f"\n  {PURP_L}Commands to edit:{RST}")
-                for i, c in enumerate(plan.commands):
-                    print(f"  {BRIGHT_BLUE}[{i}]{RST} {c}")
-                idx = input(f"  {PURP_L}Which command number to edit?{RST} ").strip()
-                if idx.isdigit():
-                    i = int(idx)
-                    if 0 <= i < len(plan.commands):
-                        new_cmd = input(f"  {PURP_L}New command:{RST} ").strip()
-                        if new_cmd:
-                            # Validate edited commands before accepting
-                            if is_destructive(new_cmd):
-                                print(f"  {YELLOW}⚠ Edited command flagged for safety review.{RST}")
-                            plan.commands[i] = new_cmd
-                            print(f"  {GREEN}✓ Updated.{RST}")
-                # Re-show plan without purple box
-                continue
+            failed = _run_plan(plan, context)
 
-            # ── Execute ──
-            print(f"\n  {SPINNER_BLUE}⚡ Executing...{RST}")
-            for i, cmd in enumerate(plan.commands):
-                print(f"  {BRIGHT_BLUE}[{i+1}/{len(plan.commands)}]{RST} $ {cmd}")
-                result = run_single_command(cmd)
-
-                if result.returncode != 0:
-                    print(f"  {BRIGHT_RED}  ✗ FAILED (code {result.returncode}){RST}")
-                    if result.stderr.strip():
-                        for line in result.stderr.strip().split("\n")[:5]:
-                            print(f"  {RED}  | {line}{RST}")
-
-                    # Offer repair
-                    if not auto_confirm:
-                        print()
-                        repair_choice = input(f"  {YELLOW}Try to auto-repair? {BRIGHT_GREEN}[Y]{RST}/{BRIGHT_RED}[N]{RST}:{RST} ").strip().lower()
-                    else:
-                        print(f"  {GREEN}  [Auto-repairing...]{RST}")
-                        repair_choice = "y"
-                    if repair_choice in ("y", "yes", ""):
-                        is_repair = True
-                        failed_plan = plan
-                        failed_result = result
-                        break  # go back to while True for repair
-                    else:
-                        print(f"  {YELLOW}✗ Abandoned.{RST}")
-                        break
-                else:
-                    if result.stdout.strip():
-                        for line in result.stdout.strip().split("\n")[:10]:
-                            print(f"  {DIM}  | {line}{RST}")
-                    else:
-                        print(f"  {GREEN}  ✓ OK{RST}")
-
-                    # Update context.cwd if it was a cd command
-                    if cmd.strip().startswith("cd "):
-                        new_dir = cmd.strip()[3:].strip()
-                        if os.path.isabs(new_dir):
-                            context.cwd = new_dir
-                        else:
-                            context.cwd = os.path.normpath(os.path.join(context.cwd, new_dir))
-                        os.chdir(context.cwd)
-
-            if not is_repair or (plan.commands.index(cmd) == len(plan.commands) - 1 and result.returncode == 0):
-                # Success on all commands
+            if failed is None:
                 history.append(ChatMessage(
                     role="assistant",
                     content=f"[Executed plan: {plan.action}]\nCommands:\n" + "\n".join(f"  $ {c}" for c in plan.commands)
                 ))
                 print_completion_block(usage)
                 break
+
+            # Offer repair
+            if repairs >= MAX_REPAIRS:
+                print(f"  {YELLOW}✗ Still failing after {MAX_REPAIRS} repair attempts. Stopping.{RST}")
+                repair_choice = "n"
+            elif not auto_confirm:
+                print()
+                repair_choice = input(f"  {YELLOW}Try to auto-repair? {BRIGHT_GREEN}[Y]{RST}/{BRIGHT_RED}[N]{RST}:{RST} ").strip().lower()
             else:
-                # We're in repair mode, loop continues
-                continue
+                print(f"  {GREEN}  [Auto-repairing...]{RST}")
+                repair_choice = "y"
+
+            if repair_choice not in ("y", "yes", ""):
+                print(f"  {YELLOW}✗ Abandoned.{RST}")
+                history.append(ChatMessage(role="assistant", content=f"[Plan failed and was abandoned]: {plan.summary}"))
+                break
+
+            repairs += 1
+            prompt = build_repair_prompt(user_inp, plan, failed, context)
         # End of while True (command loop)
 
         # Reset auto-confirm when a task completes or breaks out
