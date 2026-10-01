@@ -12,6 +12,18 @@
 - **Edit keeps your edit.** It used to ask the model for a new plan and throw the edit away.
 - Added tests and a GitHub Actions workflow that runs them on Linux and Windows.
 
+### Crashes and errors
+- **A rejected API key no longer crashes.** The error handler used a `config` variable it was never given.
+- **Retries go by the HTTP status code.** The old check looked for the word "rate" in the error text, which is inside Ollama's URL (`api/generate`) and NVIDIA's (`integrate.api`), so a wrong key or a missing model was retried for up to 93 seconds and then reported as a rate limit.
+- **Every API error is shown.** Errors other than 401, 403 and 429 used to print nothing.
+- **API keys are read from the environment** (`OPENROUTER_API_KEY`, `NVIDIA_NIM_API_KEY`, `ANTHROPIC_API_KEY`) whenever none is given. `--backend openrouter` without `--api-key` used to stop on an assert, and the Claude backend ignored `--api-key` and saved keys.
+- **A NIM container you run yourself needs no API key.**
+- **Odd plans from the model are handled.** `"commands": "ls -la"` ran each letter as its own command, and a bare JSON list crashed.
+- **`cd ~`, `cd $HOME/x` and quoted paths are followed.** They used to crash on a path that doesn't exist.
+- **Ctrl+C in the middle of a task goes back to the prompt** instead of ending the session with a traceback.
+- **The summary box copes with a missing token count.**
+- **An empty reply or an error body from OpenRouter / NIM is reported**, not a `KeyError`.
+
 ## 2.0.0
 
 ### Security
