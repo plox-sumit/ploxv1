@@ -6,9 +6,68 @@ from ploxv1.llm import LLMError
 from ploxv1.models import LLMUsage
 from ploxv1.repl import MAX_REPAIRS, print_completion_block
 
-from .conftest import plan
+from .conftest import plan, reply
 
 TASK = "remove the build folder"
+
+
+# ── The model decides between a reply and commands ──
+
+
+def test_a_reply_is_shown_and_nothing_runs(session):
+    state = session(["what is docker?"], [reply("Docker runs apps in containers.")])
+    assert "Docker runs apps in containers." in state.out
+    assert state.ran == []
+
+
+def test_plain_text_from_the_model_is_shown_as_a_reply(session):
+    state = session(["hi"], [{"error": "JSON parse failed", "raw": "Hello! How can I help?"}])
+    assert "Hello! How can I help?" in state.out
+    assert len(state.prompts) == 1
+
+
+@pytest.mark.parametrize("request_text", [
+    "can you list my s3 buckets?",
+    "describe my ec2 instances",
+    "what's using port 8080",
+    "history of my last 20 commands",
+    "hide all the .log files",
+])
+def test_tasks_that_read_like_questions_still_get_a_plan(session, request_text):
+    state = session([request_text, "y"], [plan("some-command")])
+    assert state.ran == ["some-command"]
+
+
+def test_command_output_reaches_the_next_prompt(session):
+    state = session(
+        ["list the files", "y", "what is that file for?"],
+        [plan("ls"), reply("It is a note.")],
+        output="notes-2026.txt",
+    )
+    assert "notes-2026.txt" in state.prompts[1]
+
+
+def test_the_request_and_the_history_are_sent_once(session):
+    state = session(["list the files", "y", "count the files"], [plan("ls"), reply("Three.")])
+    assert state.prompts[0].count("list the files") == 1
+    assert state.prompts[1].count("list the files") == 1
+    assert state.prompts[1].count("count the files") == 1
+
+
+def test_plan_header_shows_the_summary(session):
+    state = session(["list the files", "n"], [plan("ls")])
+    assert "PLAN: test plan" in state.out
+    assert "unknown" not in state.out
+
+
+def test_a_repair_can_end_with_an_explanation(session):
+    state = session(
+        ["list the files", "y", "y"],
+        [plan("ls missing"), reply("That folder does not exist.")],
+        failing=["ls missing"],
+    )
+    assert "That folder does not exist." in state.out
+    assert state.ran == ["ls missing"]
 
 
 @pytest.mark.parametrize("answer", ["", "wait", "nn", "q", "n"])
@@ -91,7 +150,8 @@ def test_other_api_errors_are_shown(session):
 
 
 def test_api_error_during_the_json_retry_is_shown(session):
-    state = session([TASK], [{"error": "JSON parse failed", "raw": "hello"}, LLMError("server went away", 503)])
+    mangled = {"error": "JSON parse failed", "raw": '{"commands": ["ls"'}
+    state = session([TASK], [mangled, LLMError("server went away", 503)])
     assert "server went away" in state.out
 
 
@@ -115,7 +175,7 @@ def test_commands_given_as_one_string_run_as_one_command(session):
 def test_commands_that_are_not_text_are_dropped(session):
     state = session(["list the files"], [{"commands": [{"cmd": "ls"}]}, {"commands": [None, 3]}])
     assert state.ran == []
-    assert "Could not generate commands" in state.out
+    assert "no commands and no answer" in state.out
 
 
 def test_token_line_copes_with_a_missing_count(capsys):

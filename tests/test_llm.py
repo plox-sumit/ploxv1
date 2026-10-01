@@ -74,7 +74,7 @@ def test_api_key_comes_from_the_config_then_the_environment(monkeypatch):
 def test_missing_api_key_is_a_clear_error(monkeypatch, backend):
     monkeypatch.delenv(llm.API_KEY_ENV[backend], raising=False)
     with pytest.raises(LLMError, match=llm.API_KEY_ENV[backend]):
-        llm.ask_model_text("hi", ModelConfig(backend=backend, model_name="m"), [])
+        llm.ask_model_text("hi", ModelConfig(backend=backend, model_name="m"))
 
 
 def test_a_local_nim_container_needs_no_key(monkeypatch):
@@ -87,7 +87,7 @@ def test_a_local_nim_container_needs_no_key(monkeypatch):
 
     monkeypatch.setattr(llm.requests, "post", fake_post)
     config = ModelConfig(backend="nvidia_nim", model_name="m", nvidia_nim_url="http://localhost:8000/v1/chat/completions")
-    reply, _, _ = llm.ask_model_text("hi", config, [])
+    reply, _, _ = llm.ask_model_text("hi", config)
     assert reply == "hi"
     assert "Authorization" not in sent["headers"]
 
@@ -95,7 +95,7 @@ def test_a_local_nim_container_needs_no_key(monkeypatch):
 def openrouter_answer(monkeypatch, data):
     monkeypatch.setattr(llm.requests, "post", lambda *args, **kwargs: FakeResponse(data=data))
     config = ModelConfig(backend="openrouter", model_name="m", api_key="k")
-    return llm.ask_model_text("hi", config, [])
+    return llm.ask_model_text("hi", config)
 
 
 def test_empty_content_is_an_empty_reply(monkeypatch):
@@ -114,7 +114,7 @@ def test_ollama_that_is_not_running_says_so(monkeypatch, no_sleep):
 
     monkeypatch.setattr(llm.requests, "post", refuse)
     with pytest.raises(LLMError, match="ollama serve"):
-        llm.ask_model_text("hi", ModelConfig(backend="ollama", model_name="m"), [])
+        llm.ask_model_text("hi", ModelConfig(backend="ollama", model_name="m"))
     assert no_sleep == []
 
 
@@ -125,3 +125,46 @@ def test_json_that_is_not_an_object_is_a_parse_error(raw):
 
 def test_plan_wrapped_in_a_list_is_unwrapped():
     assert llm._extract_json_from_text('[{"commands": ["ls"]}]') == {"commands": ["ls"]}
+
+
+# ── What is sent to the backends ──
+
+
+def sent_to(monkeypatch, backend, ask, **config):
+    sent = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        sent.update(json)
+        return FakeResponse(data={"response": "{}", "choices": [{"message": {"content": "{}"}}]})
+
+    monkeypatch.setattr(llm.requests, "post", fake_post)
+    ask("THE PROMPT", ModelConfig(backend=backend, model_name="m", api_key="k", **config))
+    return sent
+
+
+def test_chat_backends_get_one_system_and_one_user_message(monkeypatch):
+    sent = sent_to(monkeypatch, "openrouter", llm.ask_model_json)
+    assert [m["role"] for m in sent["messages"]] == ["system", "user"]
+    assert sent["messages"][1]["content"] == "THE PROMPT"
+
+
+def test_ollama_json_mode_is_on_for_plans_only(monkeypatch):
+    assert sent_to(monkeypatch, "ollama", llm.ask_model_json)["format"] == "json"
+    text = sent_to(monkeypatch, "ollama", llm.ask_model_text)
+    assert "format" not in text
+    assert "Only output valid JSON" not in text["prompt"]
+    assert text["prompt"].count(llm.SYSTEM_PROMPT) == 1
+
+
+@pytest.mark.parametrize("backend", ["openrouter", "nvidia_nim"])
+def test_no_token_limits_are_sent_unless_asked_for(monkeypatch, backend):
+    sent = sent_to(monkeypatch, backend, llm.ask_model_json)
+    assert "max_tokens" not in sent
+    assert "min_tokens" not in sent
+    assert sent_to(monkeypatch, backend, llm.ask_model_json, max_tokens=800)["max_tokens"] == 800
+
+
+@pytest.mark.parametrize("backend", ["ollama", "openrouter", "nvidia_nim"])
+def test_temperature_is_pinned(monkeypatch, backend):
+    sent = sent_to(monkeypatch, backend, llm.ask_model_json)
+    assert (sent.get("options") or sent)["temperature"] == 0

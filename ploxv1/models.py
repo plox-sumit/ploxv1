@@ -1,11 +1,10 @@
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
+from dataclasses import dataclass
+from typing import List, Optional
 
 
 @dataclass
 class ShellContext:
     cwd: str
-    env: Dict[str, str]
     os_name: str = "linux"
     aws_profile: Optional[str] = None
     aws_region: Optional[str] = None
@@ -15,7 +14,6 @@ class ShellContext:
 class ChatMessage:
     role: str
     content: str
-    reasoning_details: Optional[Any] = None
 
 
 @dataclass
@@ -24,8 +22,7 @@ class ModelConfig:
     model_name: str
     api_key: Optional[str] = None
     nvidia_nim_url: Optional[str] = None  # custom NVIDIA NIM endpoint URL
-    max_tokens: Optional[int] = None
-    min_tokens: Optional[int] = None  # minimum tokens per response (>= 2000)
+    max_tokens: Optional[int] = None  # None = leave it to the backend
     timeout: Optional[int] = None  # seconds; None = wait indefinitely (best for slow NVIDIA NIM)
 
 
@@ -39,18 +36,13 @@ class LLMUsage:
 
 @dataclass
 class CommandPlan:
-    domain: str
-    action: str
     summary: str
     commands: List[str]
     requires_confirmation: bool = True
-    resolved_path: Optional[str] = None
-    warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
 class CommandExecutionResult:
     command: str
     returncode: int
-    stdout: str
-    stderr: str
+    output: str  # stdout and stderr together, in the order they were printed

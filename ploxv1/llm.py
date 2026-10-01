@@ -4,11 +4,15 @@ import re
 import time
 import requests
 import anthropic
-from .models import ModelConfig, ChatMessage, LLMUsage
+from .models import ModelConfig, LLMUsage
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 NVIDIA_NIM_DEFAULT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+# Keep answers as steady as the backend allows. At the backends' own defaults
+# (0.7 to 1.0) a small model sometimes chatted when asked for a command, and the other way round.
+TEMPERATURE = 0
 
 API_KEY_ENV = {
     "openrouter": "OPENROUTER_API_KEY",
@@ -124,12 +128,12 @@ def _extract_json_from_text(raw: str) -> dict:
     return {"error": "JSON parse failed", "raw": raw}
 
 
-def _build_openai_messages(system_prompt: str, user_content: str, history: list[ChatMessage]) -> list[dict]:
-    messages = [{"role": "system", "content": system_prompt}]
-    for msg in history[-10:]:
-        messages.append({"role": msg.role, "content": msg.content})
-    messages.append({"role": "user", "content": user_content})
-    return messages
+def _build_openai_messages(system_prompt: str, user_content: str) -> list[dict]:
+    # The prompt already carries the recent history, so it is sent once, as one user message.
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
 
 
 def _first_message(backend: str, data: dict) -> dict:
@@ -140,15 +144,19 @@ def _first_message(backend: str, data: dict) -> dict:
 
 
 # ── Ollama ──────────────────────────────────────────────────────────
-def _ask_ollama_raw(prompt: str, model: str, config: ModelConfig) -> tuple[str, object, LLMUsage]:
+def _ask_ollama_raw(prompt: str, model: str, config: ModelConfig, json_mode: bool) -> tuple[str, object, LLMUsage]:
     started = time.perf_counter()
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
     }
+    payload["options"] = {"temperature": TEMPERATURE}
+    if json_mode:
+        # Ollama then only lets the model produce valid JSON
+        payload["format"] = "json"
     if config.max_tokens:
-        payload["options"] = {"num_predict": config.max_tokens}
+        payload["options"]["num_predict"] = config.max_tokens
 
     try:
         response = requests.post(OLLAMA_URL, json=payload, timeout=config.timeout or None)
@@ -181,11 +189,10 @@ def _ask_openrouter_raw(messages: list[dict], model: str, api_key: str, config: 
     payload = {
         "model": model,
         "messages": messages,
+        "temperature": TEMPERATURE,
     }
     if config.max_tokens:
         payload["max_tokens"] = config.max_tokens
-    if config.min_tokens:
-        payload["min_tokens"] = config.min_tokens
 
     try:
         response = requests.post(
@@ -237,24 +244,15 @@ def _ask_claude_raw(messages: list[dict], model: str, config: ModelConfig) -> tu
         "system": system_msg,
         "messages": user_messages,
     }
-    if config.max_tokens:
-        kwargs["max_tokens"] = config.max_tokens
-    else:
-        kwargs["max_tokens"] = 16384
+    # Claude needs a limit. 4096 fits every Claude model and is far more than a plan or a short answer uses.
+    kwargs["max_tokens"] = config.max_tokens or 4096
 
     try:
         resp = client.messages.create(**kwargs)
 
         ended = time.perf_counter()
-        content = ""
+        content = "".join(block.text for block in resp.content if block.type == "text")
         reasoning_details = None
-        for block in resp.content:
-            if block.type == "text":
-                content += block.text
-            elif block.type == "thinking":
-                content += block.thinking
-            elif block.type == "redacted_thinking":
-                reasoning_details = "redacted"
 
         usage = LLMUsage(
             response_time_seconds=ended - started,
@@ -291,12 +289,10 @@ def _ask_nvidia_nim_raw(messages: list[dict], model: str, api_key: str | None, c
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": 0.7,
+        "temperature": TEMPERATURE,
     }
     if config.max_tokens:
         payload["max_tokens"] = config.max_tokens
-    if config.min_tokens:
-        payload["min_tokens"] = config.min_tokens
 
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -330,26 +326,21 @@ ask_nvidia_nim = _with_retry(_ask_nvidia_nim_raw, max_retries=5, base_delay=3.0)
 
 # ── Public helpers ──────────────────────────────────────────────────
 SYSTEM_PROMPT = (
-    "You are ploxv1, a terminal-native DevOps AI assistant running inside a Linux shell environment. "
-    "You can answer questions conversationally AND generate executable Linux / AWS CLI commands. "
-    "When the user asks you to do something, decide whether it's a conversational question or a terminal task. "
-    "For terminal tasks, respond with a JSON plan. For general questions, respond conversationally."
+    "You are ploxv1, a terminal assistant for Linux and AWS CLI work. "
+    "Follow the instructions in the user message exactly."
 )
 
 
-def ask_model(prompt: str, config: ModelConfig, history: list[ChatMessage], *, expect_json: bool) -> tuple:
+def ask_model(prompt: str, config: ModelConfig, *, expect_json: bool) -> tuple:
     """Unified model call that routes to the correct backend."""
     if config.backend == "ollama":
-        full_prompt = SYSTEM_PROMPT + "\n\n" + "\n".join(
-            f"{m['role']}: {m['content']}" for m in _build_openai_messages(SYSTEM_PROMPT, prompt, history)
-        ) if expect_json else SYSTEM_PROMPT + "\n\nOnly output valid JSON for command plans.\n\n" + prompt
-
-        raw, reasoning, usage = ask_ollama(full_prompt, config.model_name, config)
+        full_prompt = SYSTEM_PROMPT + "\n\n" + prompt
+        raw, reasoning, usage = ask_ollama(full_prompt, config.model_name, config, expect_json)
         if expect_json:
             return _extract_json_from_text(raw), reasoning, usage
         return raw, reasoning, usage
 
-    messages = _build_openai_messages(SYSTEM_PROMPT, prompt, history)
+    messages = _build_openai_messages(SYSTEM_PROMPT, prompt)
 
     if config.backend == "openrouter":
         raw, reasoning, usage = ask_openrouter(messages, config.model_name, _api_key(config), config)
@@ -367,11 +358,11 @@ def ask_model(prompt: str, config: ModelConfig, history: list[ChatMessage], *, e
     return raw, reasoning, usage
 
 
-def ask_model_text(prompt: str, config: ModelConfig, history: list[ChatMessage]) -> tuple[str, object, LLMUsage]:
-    """Plain-text response – used for conversational / reasoning answers."""
-    return ask_model(prompt, config, history, expect_json=False)
+def ask_model_text(prompt: str, config: ModelConfig) -> tuple[str, object, LLMUsage]:
+    """Plain-text response – used when chatting about a plan."""
+    return ask_model(prompt, config, expect_json=False)
 
 
-def ask_model_json(prompt: str, config: ModelConfig, history: list[ChatMessage]) -> tuple[dict, object, LLMUsage]:
-    """JSON-plan response – used for command execution plans."""
-    return ask_model(prompt, config, history, expect_json=True)
+def ask_model_json(prompt: str, config: ModelConfig) -> tuple[dict, object, LLMUsage]:
+    """JSON response – a command plan or a reply."""
+    return ask_model(prompt, config, expect_json=True)
