@@ -15,13 +15,21 @@ Turn plain English into Linux commands, AWS CLI operations, and more. Chat natur
 
 ### Install
 
-```bash
-# 1. Copy to your machine
-cp -r /mnt/c/Users/SUMIT/Downloads/ploxv1-main ~/ploxv1
-cd ~/ploxv1
+Needs Python 3.11 or newer.
 
-# 2. Install (Python 3.11+)
-pip install -e .
+```bash
+# With pipx (recommended: keeps PloxV1 in its own environment)
+pipx install git+https://github.com/plox-sumit/ploxv1.git
+
+# Or with pip
+pip install git+https://github.com/plox-sumit/ploxv1.git
+```
+
+The Claude backend needs one extra package. Add it only if you use Claude:
+
+```bash
+pipx inject ploxv1 anthropic     # if you installed with pipx
+pip install anthropic            # if you installed with pip
 ```
 
 ### Run
@@ -32,6 +40,20 @@ ploxv1
 
 # Or directly with a backend
 ploxv1 --backend ollama --model llama3
+
+# Check what you have installed
+ploxv1 --version
+```
+
+### Work on the code
+
+```bash
+git clone https://github.com/plox-sumit/ploxv1.git
+cd ploxv1
+pip install -e ".[dev]"
+
+pytest          # nothing goes over the network
+ruff check .
 ```
 
 ## AI Backends
@@ -133,7 +155,9 @@ ploxv1 --use-config my-server
 - **Yes to ALL never covers destructive commands**
 - **Auto-repair stops after 3 tries**
 - **Edited commands** are checked again before they run
-- **API keys** stored in `~/.ploxv1_config.json` with `0o600` permissions (owner-only)
+- **API keys** you save are stored in `~/.ploxv1_config.json` with `0o600` permissions (owner-only). Leave the key blank during setup to keep it out of the file and read it from the environment instead
+
+PloxV1 runs each command through a real shell (`bash -c`, or `powershell -Command` on Windows), so a command can do anything you could do by typing it. The checks above are what stand between the AI and your machine. Read the plan before you press Y.
 
 ## File Overview
 
@@ -143,11 +167,12 @@ ploxv1/
 ├── llm.py           # Talks to AI backends (Ollama, OpenRouter, Claude, NVIDIA)
 ├── models.py        # Data classes (config, messages, plans)
 ├── repl.py          # Main loop — chat, command execution, UI
-├── executor.py      # Runs shell commands safely
-├── safety.py        # Detects dangerous commands
-├── prompting.py     # Prompts for AI (commands, chat)
+├── executor.py      # Runs one command in bash / PowerShell and streams its output
+├── safety.py        # Picks the shell; tells destructive and read-only commands apart
+├── prompting.py     # The prompt: the model answers with commands or with a reply
 ├── repair_prompting.py  # Repair prompts when commands fail
-└── __init__.py      # Package info
+└── __init__.py      # Package info and version
+tests/               # pytest suite
 ```
 
 ## License

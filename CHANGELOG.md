@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.1.0 — 2026-10-01
 
 ### Safety
 - **WSL runs commands in bash again.** The shell was picked by what is installed, and WSL has `powershell.exe` on its PATH, so Linux commands were sent to Windows PowerShell.
@@ -41,10 +41,19 @@
 - **AWS profile and region are read from the environment** and shown to the model. The fields existed but were never filled.
 - **Default Claude model is `claude-sonnet-5-5`.**
 
+### Install and housekeeping
+- **The README install steps work for everyone.** They used to copy from a folder on one machine. Now: `pipx install git+https://github.com/plox-sumit/ploxv1.git`.
+- **`anthropic` is an optional dependency**, needed only for the Claude backend and imported only when that backend is used.
+- **`ploxv1 --version`**, and the version now lives in one place (`ploxv1/__init__.py`).
+- **The config file is created owner-only** instead of being written first and locked down after, and is read and written as UTF-8.
+- **README and AGENTS.md no longer say `shell=False` makes commands safe.** Commands go through `bash -c` / `powershell -Command`, which can do anything a typed command can. The confirm step and `safety.py` are the protection.
+- Removed unused code (`box`, `colored_box`, `PLOX_COLORS`) and a stray border character in the NIM setup box.
+- CI also runs `ruff check`.
+
 ## 2.0.0
 
 ### Security
-- **Replaced `shell=True`** with safe `subprocess.run(args, shell=False)` to prevent shell injection.
+- **Replaced `shell=True`** with `subprocess.run(args, shell=False)` and an explicit shell (`bash -c` / `powershell -Command`). Note: this alone does not make model-written commands safe. See 2.1.0.
 - **Restricted config file permissions** to `0o600` so only the owner can read stored API keys.
 - **Validate edited commands** with safety checks before accepting.
 - **Removed hardcoded `/bin/bash`** — now auto-detects PowerShell on Windows, bash on Linux.

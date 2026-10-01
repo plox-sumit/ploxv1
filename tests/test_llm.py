@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import requests
 
@@ -168,3 +170,9 @@ def test_no_token_limits_are_sent_unless_asked_for(monkeypatch, backend):
 def test_temperature_is_pinned(monkeypatch, backend):
     sent = sent_to(monkeypatch, backend, llm.ask_model_json)
     assert (sent.get("options") or sent)["temperature"] == 0
+
+
+def test_claude_without_the_anthropic_package_says_how_to_install_it(monkeypatch):
+    monkeypatch.setitem(sys.modules, "anthropic", None)  # makes `import anthropic` fail
+    with pytest.raises(LLMError, match="pip install anthropic"):
+        llm.ask_model_text("hi", ModelConfig(backend="claude", model_name="m", api_key="k"))

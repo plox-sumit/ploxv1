@@ -102,40 +102,6 @@ _COMPLETION_MSGS = [
 ]
 
 
-# ── Box drawing helpers ─────────────────────────────────────────────
-def box(text: str, border_color: str = PURP, width: int = 70) -> str:
-    lines = text.strip().split("\n")
-    top = f"{border_color}╭{'─' * (width - 2)}╮{RST}"
-    mid = []
-    for line in lines:
-        visible_len = len(line.replace("\033", ""))  # approximate
-        padded = line + " " * max(0, width - 2 - _visible_len(line))
-        mid.append(f"{border_color}│{RST} {padded}{border_color}│{RST}")
-    bot = f"{border_color}╰{'─' * (width - 2)}╯{RST}"
-    return "\n".join([top] + mid + [bot])
-
-
-def _visible_len(s: str) -> int:
-    """Approximate visible length of a string with ANSI codes."""
-    return len(re.sub(r"\033\[[0-9;]*m", "", s))
-
-
-def colored_box(text: str, border_color: str = PURP, fill_color: str = "", width: int = 68) -> str:
-    """Draw a box with optional background fill color."""
-    lines = text.strip().split("\n")
-    top = f"{border_color}╭{'─' * (width - 2)}╮{RST}"
-    mid = []
-    for line in lines:
-        vl = _visible_len(line)
-        padded = line + " " * max(0, width - 2 - vl)
-        if fill_color:
-            mid.append(f"{border_color}│{fill_color}{padded}{RST}{border_color}│{RST}")
-        else:
-            mid.append(f"{border_color}│{RST} {padded}{border_color}│{RST}")
-    bot = f"{border_color}╰{'─' * (width - 2)}╯{RST}"
-    return "\n".join([top] + mid + [bot])
-
-
 def print_highlight_key_val(key: str, val: str, key_color: str = PURP_L, val_color: str = WHITE):
     print(f"  {key_color}{key}:{RST} {val_color}{val}{RST}")
 
@@ -156,8 +122,6 @@ PLOX_LOGO = [
     " ╚████╔╝   ██║",
     "  ╚═══╝    ╚═╝",
 ]
-
-PLOX_COLORS = [PURP_D, PURP, PURP_L, "\033[38;5;135m", "\033[38;5;171m", "\033[38;5;177m"]
 
 
 def _write_safe(text: str):
@@ -220,7 +184,7 @@ def print_welcome():
 def load_stored_configs() -> dict:
     if os.path.exists(CONFIG_PATH):
         try:
-            with open(CONFIG_PATH) as f:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, IOError):
             return {}
@@ -228,10 +192,12 @@ def load_stored_configs() -> dict:
 
 
 def save_stored_configs(data: dict):
-    with open(CONFIG_PATH, "w") as f:
+    # The file can hold API keys, so it is created owner-only rather than opened up and then locked down
+    fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     try:
-        os.chmod(CONFIG_PATH, 0o600)
+        os.chmod(CONFIG_PATH, 0o600)  # for a file made by an older version
     except OSError:
         pass  # may fail on non-POSIX
 
@@ -343,7 +309,7 @@ def setup_model() -> ModelConfig:
             print(f"{PURP}│{RST}  {DIM}$ docker run -d --gpus all -p 8000:8000 \\{RST}        {PURP}│{RST}")
             print(f"{PURP}│{RST}  {DIM}  nvcr.io/nvidia/nim/<model>:latest{RST}              {PURP}│{RST}")
             print(f"{PURP}│{RST}                                                    {PURP}│{RST}")
-            print(f"{PURP}│{RST}  Then endpoint: http://localhost:8000/v1/chat/completions {PURP}│{RST}│{RST}")
+            print(f"{PURP}│{RST}  Then endpoint: http://localhost:8000/v1/chat/completions {PURP}│{RST}")
             print(f"{PURP}│{RST}  Or use NVIDIA cloud API (api_key required)        {PURP}│{RST}")
             print(f"{PURP}└{'─' * 56}┘{RST}")
 
@@ -452,12 +418,12 @@ def _handle_api_error(error: LLMError, config: ModelConfig):
         print(f"  {YELLOW}Your API key was rejected. Please check:{RST}")
         print(f"    1. Did you select the correct backend? (You chose: {config.backend})")
         if config.backend == "nvidia_nim":
-            print(f"    2. NVIDIA NIM needs an NVIDIA API key (nvapi-...). Set NVIDIA_NIM_API_KEY env var.")
-            print(f"    3. Or use a local NIM docker container instead of the cloud API.")
+            print("    2. NVIDIA NIM needs an NVIDIA API key (nvapi-...). Set NVIDIA_NIM_API_KEY env var.")
+            print("    3. Or use a local NIM docker container instead of the cloud API.")
         elif config.backend == "openrouter":
-            print(f"    2. OpenRouter needs an OpenRouter API key (sk-or-...). Set OPENROUTER_API_KEY env var.")
+            print("    2. OpenRouter needs an OpenRouter API key (sk-or-...). Set OPENROUTER_API_KEY env var.")
         elif config.backend == "claude":
-            print(f"    2. Claude needs an Anthropic API key (sk-ant-...). Set ANTHROPIC_API_KEY env var.")
+            print("    2. Claude needs an Anthropic API key (sk-ant-...). Set ANTHROPIC_API_KEY env var.")
         print(f"\n  {CYAN}Run again and enter a valid API key when prompted.{RST}")
     elif error.status == 403:
         print(f"\n  {BRIGHT_RED}✗ Access forbidden.{RST} Check that your API key has the correct permissions.")
